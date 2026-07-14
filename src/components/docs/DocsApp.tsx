@@ -470,7 +470,21 @@ export function DocsApp() {
     if (!clean) return;
     savePrefs({ name: clean });
     setUserName(clean);
-  }, []);
+    // If the current workspace still has the generic default name, personalize it.
+    const currentId = workspaceIdRef.current;
+    if (currentId && /^(my workspace|workspace \d+)$/i.test(workspaceNameRef.current)) {
+      const personalized = `${clean}'s Workspace`;
+      workspaceNameRef.current = personalized;
+      void (async () => {
+        const ws = await persistence.getWorkspace(currentId);
+        if (ws) {
+          ws.name = personalized;
+          await persistence.putWorkspace(ws);
+          await refreshWorkspaceList();
+        }
+      })();
+    }
+  }, [refreshWorkspaceList]);
 
   const openFromHome = useCallback(
     (fileId: string, subtopicId?: string) => {
