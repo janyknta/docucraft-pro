@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, Plus, Download, Upload, Trash2, Check, FolderOpen, Pencil } from "lucide-react";
+import { ChevronDown, Plus, Download, Upload, Trash2, Check, FolderOpen } from "lucide-react";
 
 interface WorkspaceLite {
   id: string;
