@@ -198,6 +198,7 @@ export function Sidebar({
 
       <div className="flex gap-2 border-t border-border p-3">
         <button
+          onClick={() => setSettingsOpen(true)}
           className="flex flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
         >
           <Settings className="h-4 w-4" />
@@ -212,7 +213,143 @@ export function Sidebar({
           <ThemeIcon className="h-4 w-4" />
         </button>
       </div>
+
+      {settingsOpen && (
+        <SettingsModal
+          onClose={() => setSettingsOpen(false)}
+          currentWorkspaceName={currentWorkspaceName}
+          canDeleteWorkspace={canDeleteWorkspace}
+          onRenameCurrentWorkspace={onRenameCurrentWorkspace}
+          onDeleteCurrentWorkspace={onDeleteCurrentWorkspace}
+          onClearStorage={onClearStorage}
+        />
+      )}
     </aside>
+  );
+}
+
+function SettingsModal({
+  onClose,
+  currentWorkspaceName,
+  canDeleteWorkspace,
+  onRenameCurrentWorkspace,
+  onDeleteCurrentWorkspace,
+  onClearStorage,
+}: {
+  onClose: () => void;
+  currentWorkspaceName: string;
+  canDeleteWorkspace: boolean;
+  onRenameCurrentWorkspace: (name: string) => void;
+  onDeleteCurrentWorkspace: () => void;
+  onClearStorage: () => void;
+}) {
+  const [name, setName] = useState(currentWorkspaceName);
+  const [confirm, setConfirm] = useState<null | "delete" | "clear">(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const saveName = () => {
+    const v = name.trim();
+    if (v && v !== currentWorkspaceName) onRenameCurrentWorkspace(v);
+    onClose();
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-foreground/20 p-4 backdrop-blur-sm">
+      <div className="w-full max-w-md rounded-2xl border border-border bg-background shadow-2xl">
+        <div className="flex items-center justify-between border-b border-border px-5 py-4">
+          <h2 className="text-base font-semibold">Settings</h2>
+          <button onClick={onClose} className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground" aria-label="Close">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="space-y-5 p-5">
+          <div>
+            <label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Rename workspace
+            </label>
+            <div className="mt-2 flex gap-2">
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary/60 focus:ring-2 focus:ring-primary/10"
+                placeholder="Workspace name"
+              />
+              <button
+                onClick={saveName}
+                disabled={!name.trim() || name.trim() === currentWorkspaceName}
+                className="shrink-0 rounded-md bg-foreground px-3 py-2 text-sm font-medium text-background hover:opacity-90 disabled:opacity-40"
+              >
+                Save
+              </button>
+            </div>
+          </div>
+
+          <div className="border-t border-border pt-5">
+            <label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Danger zone
+            </label>
+            <div className="mt-3 space-y-2">
+              <button
+                onClick={() => setConfirm("delete")}
+                disabled={!canDeleteWorkspace}
+                title={canDeleteWorkspace ? "" : "You can't delete your only workspace"}
+                className="flex w-full items-center justify-between rounded-md border border-border px-3 py-2 text-sm text-destructive transition-colors hover:bg-destructive/5 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <span className="flex items-center gap-2">
+                  <Trash2 className="h-4 w-4" />
+                  Delete workspace
+                </span>
+                <span className="truncate text-xs text-muted-foreground">{currentWorkspaceName}</span>
+              </button>
+              <button
+                onClick={() => setConfirm("clear")}
+                className="flex w-full items-center gap-2 rounded-md border border-border px-3 py-2 text-sm text-destructive transition-colors hover:bg-destructive/5"
+              >
+                <AlertTriangle className="h-4 w-4" />
+                Clear all storage
+              </button>
+            </div>
+            <p className="mt-2 text-xs text-muted-foreground">
+              Clearing storage removes every workspace, file, bookmark, and preference on this device.
+            </p>
+          </div>
+        </div>
+
+        {confirm && (
+          <div className="border-t border-border bg-accent/30 p-5">
+            <p className="text-sm text-foreground">
+              {confirm === "delete"
+                ? `Delete “${currentWorkspaceName}”? This can't be undone.`
+                : "Clear everything on this device? This can't be undone."}
+            </p>
+            <div className="mt-3 flex justify-end gap-2">
+              <button
+                onClick={() => setConfirm(null)}
+                className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  if (confirm === "delete") onDeleteCurrentWorkspace();
+                  else onClearStorage();
+                  onClose();
+                }}
+                className="rounded-md bg-destructive px-3 py-1.5 text-sm font-medium text-destructive-foreground hover:opacity-90"
+              >
+                {confirm === "delete" ? "Delete" : "Clear"}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
