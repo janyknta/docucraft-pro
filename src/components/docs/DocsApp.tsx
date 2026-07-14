@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useLocation, useNavigate } from "@tanstack/react-router";
 import gsap from "gsap";
 import {
   BookOpen,
@@ -11,15 +12,20 @@ import {
   Monitor,
   PanelLeftClose,
   PanelLeftOpen,
+  Undo2,
+  Home,
 } from "lucide-react";
 import { DropZone } from "./DropZone";
 import { Sidebar } from "./Sidebar";
 import { MarkdownViewer } from "./MarkdownViewer";
 import { CommandPalette } from "./CommandPalette";
 import { WorkspaceMenu } from "./WorkspaceMenu";
-import type { MdFile } from "@/lib/markdown-utils";
-import { parseHeadings, readingMinutes } from "@/lib/markdown-utils";
+import { HomePage } from "./HomePage";
+import type { MdFile, MdChunk } from "@/lib/markdown-utils";
+import type { Highlight } from "@/lib/dom-highlighter";
+import { parseHeadings, readingMinutes, splitIntoSubtopics } from "@/lib/markdown-utils";
 import { useReadingProgress, pickResume } from "@/lib/reading-progress";
+import { toast } from "sonner";
 import {
   persistence,
   loadPrefs,
@@ -70,6 +76,15 @@ export function DocsApp() {
   const [workspaces, setWorkspaces] = useState<WorkspaceLite[]>([]);
   const [workspaceId, setWorkspaceId] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
+  const [bookmarks, setBookmarks] = useState<string[]>([]);
+  const [highlights, setHighlights] = useState<Highlight[]>([]);
+
+  // Home page + personalization.
+  const location = useLocation();
+  const navigate = useNavigate();
+  const showHome = location.pathname === "/";
+  const [userName, setUserName] = useState<string | null>(null);
+  const firstVisitRef = useRef(false);
 
   const inputRef = useRef<HTMLInputElement>(null);
   const sidebarWrapRef = useRef<HTMLDivElement>(null);
@@ -79,8 +94,8 @@ export function DocsApp() {
 
   // Refs the (async, debounced) save reads from, so it always writes the latest
   // state without being recreated on every render.
-  const snapshotRef = useRef({ files, activeFileId, expanded, sidebarCollapsed });
-  snapshotRef.current = { files, activeFileId, expanded, sidebarCollapsed };
+  const snapshotRef = useRef({ files, activeFileId, expanded, sidebarCollapsed, bookmarks, highlights });
+  snapshotRef.current = { files, activeFileId, expanded, sidebarCollapsed, bookmarks, highlights };
   const scrollRef = useRef(0);
   const workspaceIdRef = useRef<string | null>(null);
   const workspaceNameRef = useRef("My workspace");
@@ -172,6 +187,8 @@ export function DocsApp() {
       createdAt: createdAtRef.current,
       updatedAt: Date.now(),
       files: s.files.map((f) => ({ id: f.id, name: f.name, content: f.content })),
+      bookmarks: s.bookmarks,
+      highlights: s.highlights,
       ui: {
         activeFileId: s.activeFileId,
         expanded: s.expanded,
@@ -208,11 +225,14 @@ export function DocsApp() {
       name: f.name,
       content: f.content,
       headings: parseHeadings(f.content, f.id),
+      subtopics: splitIntoSubtopics(f.content, f.name),
     }));
     setFiles(parsed);
     setActiveFileId(ws.ui?.activeFileId ?? parsed[0]?.id ?? null);
     setExpanded(ws.ui?.expanded ?? {});
     setSidebarCollapsed(!!ws.ui?.sidebarCollapsed);
+    setBookmarks(ws.bookmarks ?? []);
+    setHighlights(ws.highlights ?? []);
     setWorkspaceId(ws.id);
     workspaceIdRef.current = ws.id;
     workspaceNameRef.current = ws.name;
@@ -242,6 +262,8 @@ export function DocsApp() {
     (async () => {
       try {
         const prefs = loadPrefs();
+        setUserName(prefs.name);
+        firstVisitRef.current = !prefs.name;
         let list = await persistence.listWorkspaces().catch(() => [] as WorkspaceRecord[]);
         let ws: WorkspaceRecord;
         if (list.length === 0) {
@@ -301,7 +323,7 @@ export function DocsApp() {
         fileList.map(async (f) => {
           const content = await f.text();
           const id = `${f.name}-${crypto.randomUUID().slice(0, 8)}`;
-          return { id, name: f.name, content, headings: parseHeadings(content, id) };
+          return { id, name: f.name, content, headings: parseHeadings(content, id), subtopics: splitIntoSubtopics(content, f.name) };
         }),
       );
       setFiles((prev) => [...prev, ...parsed]);
@@ -314,9 +336,10 @@ export function DocsApp() {
         const resume = resumeName ? parsed.find((f) => f.name === resumeName) : null;
         return (resume ?? parsed[0])?.id ?? null;
       });
+      navigate({ to: "/md-reader" }); // uploading takes you straight into reading
       markDirty();
     },
-    [progress, markDirty],
+    [progress, markDirty, navigate],
   );
 
   const handleFileInput = (list: FileList | null) => {
@@ -333,25 +356,80 @@ export function DocsApp() {
   const handleSelect = (fileId: string, headingId?: string, query?: string) => {
     setActiveFileId(fileId);
     if (query !== undefined) setHighlightQuery(query || null);
-    if (headingId) {
-      window.location.hash = headingId;
-      setScrollTarget(headingId);
-      setTimeout(() => setScrollTarget(null), 100);
-    } else {
-      setScrollTarget(null);
-      window.location.hash = "";
+    
+    let targetHeadingId = headingId;
+    if (!targetHeadingId) {
+       const file = files.find(f => f.id === fileId);
+       const subs = file?.subtopics || (file ? splitIntoSubtopics(file.content, file.name) : []);
+       targetHeadingId = subs?.[0]?.id || "preamble";
     }
+    setActiveHeadingId(targetHeadingId);
+    
     setDrawerOpen(false);
     markDirty();
   };
 
   const removeFile = (id: string) => {
+    const index = files.findIndex((f) => f.id === id);
+    const fileToRestore = files[index];
+    const activeWas = activeFileId;
+
+    if (!fileToRestore) return;
+
     setFiles((prev) => prev.filter((f) => f.id !== id));
     if (activeFileId === id) {
       setActiveFileId(files.find((f) => f.id !== id)?.id ?? null);
     }
     markDirty();
+
+    toast("File deleted", {
+      description: fileToRestore.name,
+      duration: 6000,
+      icon: <Undo2 className="h-4 w-4" />,
+      className: "bg-background/60 backdrop-blur-xl border border-border/50 shadow-2xl",
+      action: {
+        label: "Undo",
+        onClick: () => {
+          setFiles((prev) => {
+            const newFiles = [...prev];
+            newFiles.splice(index, 0, fileToRestore);
+            return newFiles;
+          });
+          if (activeWas === id) {
+            setActiveFileId(id);
+          }
+          markDirty();
+        },
+      },
+    });
   };
+
+  const renameFile = useCallback(
+    (id: string, newName: string) => {
+      setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, name: newName } : f)));
+      markDirty();
+    },
+    [markDirty],
+  );
+
+  const addHighlight = useCallback(
+    (text: string, color: string, fileId: string) => {
+      setHighlights((prev) => [
+        ...prev,
+        { id: crypto.randomUUID(), fileId, text, color },
+      ]);
+      markDirty();
+    },
+    [markDirty],
+  );
+
+  const removeHighlight = useCallback(
+    (id: string) => {
+      setHighlights((prev) => prev.filter((h) => h.id !== id));
+      markDirty();
+    },
+    [markDirty],
+  );
 
   const toggleFile = useCallback(
     (fileId: string) => {
@@ -366,11 +444,39 @@ export function DocsApp() {
     markDirty();
   }, [markDirty]);
 
+  const toggleBookmark = useCallback(
+    (fileId: string, subtopicId: string) => {
+      const id = `${fileId}#${subtopicId}`;
+      setBookmarks((prev) =>
+        prev.includes(id) ? prev.filter((b) => b !== id) : [...prev, id],
+      );
+      markDirty();
+    },
+    [markDirty],
+  );
+
+  const submitName = useCallback((name: string) => {
+    const clean = name.trim();
+    if (!clean) return;
+    savePrefs({ name: clean });
+    setUserName(clean);
+  }, []);
+
+  const openFromHome = useCallback(
+    (fileId: string) => {
+      navigate({ to: "/md-reader" });
+      handleSelect(fileId);
+    },
+    // handleSelect is stable enough for our needs; intentionally minimal deps.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [navigate],
+  );
+
   const handleContentChange = useCallback(
     (fileId: string, content: string) => {
       setFiles((prev) =>
         prev.map((f) =>
-          f.id === fileId ? { ...f, content, headings: parseHeadings(content, fileId) } : f,
+          f.id === fileId ? { ...f, content, headings: parseHeadings(content, fileId), subtopics: splitIntoSubtopics(content, f.name) } : f,
         ),
       );
       markDirty();
@@ -392,7 +498,7 @@ export function DocsApp() {
   }, [activeFileId, activeFile, touch]);
 
   const cycleTheme = () =>
-    setTheme((t) => (t === "system" ? "light" : t === "light" ? "dark" : "system"));
+    setTheme((t) => (t === "dark" ? "light" : "dark"));
 
   const totalChapters = files.length;
   const completedCount = files.filter((f) => progress[f.name]?.completed).length;
@@ -477,6 +583,69 @@ export function DocsApp() {
     [hydrateWorkspace],
   );
 
+  const renameWorkspace = useCallback(
+    async (id: string, newName: string) => {
+      const ws = await persistence.getWorkspace(id);
+      if (!ws) return;
+      ws.name = newName;
+      await persistence.putWorkspace(ws);
+      if (id === workspaceIdRef.current) {
+        workspaceNameRef.current = newName;
+      }
+      await refreshWorkspaceList();
+    },
+    [refreshWorkspaceList],
+  );
+
+  // ---- home page data ----
+  const recentItems = files
+    .map((f) => ({ f, at: progress[f.name]?.lastReadAt ?? 0 }))
+    .filter((x) => x.at > 0)
+    .sort((a, b) => b.at - a.at)
+    .slice(0, 6)
+    .map(({ f }) => ({
+      id: f.id,
+      name: f.name,
+      minutes: readingMinutes(f.content),
+      progress: progress[f.name]?.scrollPct ?? 0,
+      completed: !!progress[f.name]?.completed,
+    }));
+
+  const resumeName = pickResume(
+    files.map((f) => f.name),
+    progress,
+  );
+  const resumeFile = resumeName ? (files.find((f) => f.name === resumeName) ?? null) : null;
+  const resume = resumeFile ? { id: resumeFile.id, name: resumeFile.name } : null;
+
+  const workspaceItems = workspaces.map((w) => ({
+    id: w.id,
+    name: w.name,
+    current: w.id === workspaceId,
+  }));
+
+  const bookmarkItems = bookmarks
+    .map((b) => {
+      const [fId, sId] = b.split("#");
+      const file = files.find((f) => f.id === fId);
+      if (!file) return null;
+      const subs = file.subtopics || splitIntoSubtopics(file.content, file.name);
+      const sub = subs.find((s) => s.id === sId);
+      if (!sub) return null;
+      return { fileId: fId, subtopicId: sId, name: sub.title };
+    })
+    .filter(Boolean) as { fileId: string; subtopicId: string; name: string }[];
+
+  const goHome = useCallback(() => navigate({ to: "/" }), [navigate]);
+
+  const openWorkspaceFromHome = useCallback(
+    async (id: string) => {
+      if (id !== workspaceIdRef.current) await switchWorkspace(id);
+      navigate({ to: "/md-reader" });
+    },
+    [switchWorkspace, navigate],
+  );
+
   const workspaceMenu = (
     <WorkspaceMenu
       workspaces={workspaces}
@@ -486,11 +655,58 @@ export function DocsApp() {
       onImport={importWorkspace}
       onExport={exportWorkspace}
       onDelete={deleteWorkspace}
+      onRename={renameWorkspace}
     />
   );
 
   if (booting) {
     return <div className="min-h-dvh bg-background" />;
+  }
+
+  if (showHome) {
+    return (
+      <div className="min-h-dvh bg-background">
+        <Header
+          theme={theme}
+          onCycleTheme={cycleTheme}
+          onMenu={null}
+          hideMenu
+          onOpenPalette={() => setPaletteOpen(true)}
+          hasFiles={files.length > 0}
+          onAddFiles={() => inputRef.current?.click()}
+          saveStatus={saveStatus}
+          workspaceMenu={workspaceMenu}
+          onHome={goHome}
+        />
+        <CommandPalette
+          files={files}
+          open={paletteOpen}
+          onOpenChange={setPaletteOpen}
+          onSelect={openFromHome}
+        />
+        <HomePage
+          userName={userName}
+          isFirstVisit={firstVisitRef.current}
+          onSubmitName={submitName}
+          resume={resume}
+          recent={recentItems}
+          workspaces={workspaceItems}
+          bookmarks={bookmarkItems}
+          hasFiles={files.length > 0}
+          onOpenFile={openFromHome}
+          onSwitchWorkspace={openWorkspaceFromHome}
+          onUpload={() => inputRef.current?.click()}
+        />
+        <input
+          ref={inputRef}
+          type="file"
+          multiple
+          accept=".md,.markdown,.mdx,.txt,text/markdown"
+          className="hidden"
+          onChange={(e) => handleFileInput(e.target.files)}
+        />
+      </div>
+    );
   }
 
   if (files.length === 0) {
@@ -506,6 +722,7 @@ export function DocsApp() {
           onAddFiles={() => inputRef.current?.click()}
           saveStatus={saveStatus}
           workspaceMenu={workspaceMenu}
+          onHome={goHome}
         />
         <DropZone onFiles={addFiles} fullscreen />
       </div>
@@ -525,6 +742,7 @@ export function DocsApp() {
         onToggleSidebar={toggleSidebar}
         saveStatus={saveStatus}
         workspaceMenu={workspaceMenu}
+        onHome={goHome}
       />
 
       <CommandPalette
@@ -550,6 +768,10 @@ export function DocsApp() {
               onSelect={handleSelect}
               onAddFiles={() => inputRef.current?.click()}
               onRemoveFile={removeFile}
+              onRenameFile={renameFile}
+              theme={theme}
+              onCycleTheme={cycleTheme}
+              bookmarks={bookmarkItems}
             />
           </div>
           {!sidebarCollapsed && (
@@ -601,6 +823,10 @@ export function DocsApp() {
                   onSelect={handleSelect}
                   onAddFiles={() => inputRef.current?.click()}
                   onRemoveFile={removeFile}
+                  onRenameFile={renameFile}
+                  theme={theme}
+                  onCycleTheme={cycleTheme}
+                  bookmarks={bookmarkItems}
                 />
               </div>
             </div>
@@ -613,9 +839,8 @@ export function DocsApp() {
               file={activeFile}
               prevFile={prevFile}
               nextFile={nextFile}
-              onNavFile={(id) => handleSelect(id)}
-              onActiveHeading={setActiveHeadingId}
-              scrollTargetId={scrollTarget}
+              onNav={(fId, sId) => handleSelect(fId, sId || undefined)}
+              activeSubtopicId={activeHeadingId}
               highlightQuery={highlightQuery}
               onContentChange={handleContentChange}
               chapterNumber={activeIdx + 1}
@@ -624,6 +849,11 @@ export function DocsApp() {
               allComplete={allComplete}
               nextReadingMin={nextReadingMin}
               onReadProgress={handleReadProgress}
+              isBookmarked={!!activeFile && !!activeHeadingId && bookmarks.includes(`${activeFile.id}#${activeHeadingId}`)}
+              onToggleBookmark={() => activeFile && activeHeadingId && toggleBookmark(activeFile.id, activeHeadingId)}
+              highlights={highlights.filter(h => h.fileId === activeFile.id)}
+              onAddHighlight={(text, color) => addHighlight(text, color, activeFile.id)}
+              onRemoveHighlight={removeHighlight}
             />
           )}
         </main>
@@ -641,23 +871,6 @@ export function DocsApp() {
   );
 }
 
-function SaveIndicator({ status }: { status: SaveStatus }) {
-  if (status === "idle") return null;
-  const map: Record<Exclude<SaveStatus, "idle">, { label: string; dot: string; pulse?: boolean }> =
-    {
-      saving: { label: "Saving…", dot: "bg-amber-500", pulse: true },
-      saved: { label: "All changes saved", dot: "bg-emerald-500" },
-      restored: { label: "Restored", dot: "bg-primary" },
-    };
-  const { label, dot, pulse } = map[status];
-  return (
-    <span className="hidden items-center gap-1.5 text-xs text-muted-foreground sm:inline-flex">
-      <span className={`h-1.5 w-1.5 rounded-full ${dot} ${pulse ? "animate-pulse" : ""}`} />
-      {label}
-    </span>
-  );
-}
-
 function Header({
   theme,
   onCycleTheme,
@@ -670,6 +883,7 @@ function Header({
   onToggleSidebar,
   saveStatus,
   workspaceMenu,
+  onHome,
 }: {
   theme: Theme;
   onCycleTheme: () => void;
@@ -682,8 +896,8 @@ function Header({
   onToggleSidebar?: () => void;
   saveStatus?: SaveStatus;
   workspaceMenu?: React.ReactNode;
+  onHome?: () => void;
 }) {
-  const ThemeIcon = theme === "dark" ? Sun : theme === "light" ? Moon : Monitor;
   return (
     <header className="sticky top-0 z-30 flex h-16 items-center gap-3 border-b border-border bg-background/80 px-4 backdrop-blur-md md:px-6">
       {!hideMenu && (
@@ -709,35 +923,38 @@ function Header({
           )}
         </button>
       )}
-      <div className="flex items-center gap-2">
-        <div className="flex h-7 w-7 items-center justify-center rounded-md bg-foreground text-background">
-          <BookOpen className="h-4 w-4" />
-        </div>
-        <span className="hidden text-sm font-semibold tracking-tight sm:inline">Markdown Docs</span>
+      <div
+        className="flex items-center gap-2 rounded-md px-1 py-1 text-muted-foreground transition-colors hover:text-foreground"
+        aria-label="Home"
+        title="Home"
+      >
+        <span className="hidden text-sm font-semibold tracking-tight text-foreground sm:inline">
+          Markdown Docs
+        </span>
       </div>
 
-      {workspaceMenu}
-
       {hasFiles && (
-        <button
-          onClick={onOpenPalette}
-          className="ml-2 hidden min-w-52 items-center gap-2 rounded-md border border-border bg-muted/50 px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground lg:flex"
-        >
-          <Search className="h-3.5 w-3.5" />
-          <span>Search documentation…</span>
-          <span className="ml-auto flex items-center gap-1">
-            <kbd className="rounded border border-border bg-background px-1 py-0.5 font-mono text-[10px]">
-              ⌘
-            </kbd>
-            <kbd className="rounded border border-border bg-background px-1 py-0.5 font-mono text-[10px]">
-              K
-            </kbd>
-          </span>
-        </button>
+        <div className="absolute left-1/2 top-1/2 hidden -translate-x-1/2 -translate-y-1/2 lg:flex">
+          <button
+            onClick={onOpenPalette}
+            className="flex w-[400px] items-center gap-2 rounded-md border border-border bg-muted/50 px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+          >
+            <Search className="h-3.5 w-3.5" />
+            <span>Search documentation…</span>
+            <span className="ml-auto flex items-center gap-1">
+              <kbd className="rounded border border-border bg-background px-1 py-0.5 font-mono text-[10px]">
+                ⌘
+              </kbd>
+              <kbd className="rounded border border-border bg-background px-1 py-0.5 font-mono text-[10px]">
+                K
+              </kbd>
+            </span>
+          </button>
+        </div>
       )}
 
       <div className="ml-auto flex items-center gap-2">
-        {saveStatus && <SaveIndicator status={saveStatus} />}
+        {workspaceMenu}
         {hasFiles && (
           <>
             <button
@@ -749,22 +966,15 @@ function Header({
             </button>
             <button
               onClick={onAddFiles}
-              className="rounded-md p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              className="flex h-8 w-8 items-center justify-center gap-1.5 rounded-md border border-border text-muted-foreground transition-colors hover:bg-accent hover:text-foreground sm:w-auto sm:px-3"
               aria-label="Add files"
               title="Add files"
             >
               <Plus className="h-4 w-4" />
+              <span className="hidden text-sm font-medium sm:inline">Upload</span>
             </button>
           </>
         )}
-        <button
-          onClick={onCycleTheme}
-          className="rounded-md p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          aria-label={`Theme: ${theme}`}
-          title={`Theme: ${theme}`}
-        >
-          <ThemeIcon className="h-4 w-4" />
-        </button>
       </div>
     </header>
   );

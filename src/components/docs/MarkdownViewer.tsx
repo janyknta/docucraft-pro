@@ -17,6 +17,7 @@ import {
   Clock,
   Pencil,
   Eye,
+  Bookmark,
   Info,
   AlertTriangle,
   Lightbulb,
@@ -28,14 +29,15 @@ import { slugify } from "@/lib/markdown-utils";
 import { Mermaid } from "./Mermaid";
 import { detectEmbed, EmbedFrame, isVideoUrl, VideoPlayer } from "@/lib/media-embeds";
 import { Lightbox } from "./Lightbox";
+import { applyHighlightsToDOM, type Highlight } from "@/lib/dom-highlighter";
+import { splitIntoSubtopics } from "@/lib/markdown-utils";
 
 interface Props {
   file: MdFile;
   prevFile: MdFile | null;
   nextFile: MdFile | null;
-  onNavFile: (id: string) => void;
-  onActiveHeading: (id: string | null) => void;
-  scrollTargetId: string | null;
+  onNav: (fileId: string, subtopicId: string | null) => void;
+  activeSubtopicId: string | null;
   highlightQuery: string | null;
   onContentChange: (fileId: string, content: string) => void;
   chapterNumber: number;
@@ -44,6 +46,11 @@ interface Props {
   allComplete: boolean;
   nextReadingMin: number | null;
   onReadProgress: (fraction: number) => void;
+  isBookmarked: boolean;
+  onToggleBookmark: () => void;
+  highlights: Highlight[];
+  onAddHighlight: (text: string, color: string) => void;
+  onRemoveHighlight: (id: string) => void;
 }
 
 const stripExt = (name: string) => name.replace(/\.(md|markdown|mdx|txt)$/i, "");
@@ -52,9 +59,8 @@ export function MarkdownViewer({
   file,
   prevFile,
   nextFile,
-  onNavFile,
-  onActiveHeading,
-  scrollTargetId,
+  onNav,
+  activeSubtopicId,
   highlightQuery,
   onContentChange,
   chapterNumber,
@@ -63,13 +69,80 @@ export function MarkdownViewer({
   allComplete,
   nextReadingMin,
   onReadProgress,
+  isBookmarked,
+  onToggleBookmark,
+  highlights,
+  onAddHighlight,
+  onRemoveHighlight,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [progress, setProgress] = useState(0);
   const [showTop, setShowTop] = useState(false);
   const [editMode, setEditMode] = useState(false);
   const [draft, setDraft] = useState(file.content);
+  
+  const allChunks = useMemo(() => file.subtopics || splitIntoSubtopics(file.content, file.name), [file.subtopics, file.content, file.name]);
+  
+  const activeChunk = useMemo(() => {
+    return allChunks.find(s => s.id === activeSubtopicId) || allChunks[0] || { id: 'preamble', title: stripExt(file.name), content: file.content };
+  }, [allChunks, activeSubtopicId, file.content, file.name]);
+
+  const chunkIndex = allChunks.findIndex(s => s.id === activeChunk.id);
+  const isLastChunk = chunkIndex === allChunks.length - 1;
+  const prevChunk = chunkIndex > 0 ? allChunks[chunkIndex - 1] : null;
+  const nextChunk = chunkIndex >= 0 && chunkIndex < allChunks.length - 1 ? allChunks[chunkIndex + 1] : null;
+
   const [lightbox, setLightbox] = useState<{ src: string; alt?: string } | null>(null);
+
+  const [selectionRect, setSelectionRect] = useState<DOMRect | null>(null);
+  const [selectedText, setSelectedText] = useState("");
+
+  useEffect(() => {
+    const handleSelection = () => {
+      if (editMode) {
+        setSelectionRect(null);
+        return;
+      }
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed || !selection.toString().trim()) {
+        setSelectionRect(null);
+        return;
+      }
+
+      const range = selection.getRangeAt(0);
+      if (containerRef.current && containerRef.current.contains(range.commonAncestorContainer)) {
+        setSelectionRect(range.getBoundingClientRect());
+        setSelectedText(selection.toString());
+      } else {
+        setSelectionRect(null);
+      }
+    };
+
+    document.addEventListener("selectionchange", handleSelection);
+    return () => document.removeEventListener("selectionchange", handleSelection);
+  }, [editMode]);
+
+  useEffect(() => {
+    if (containerRef.current && !editMode) {
+      applyHighlightsToDOM(containerRef.current, highlights);
+    }
+  }, [file.content, highlights, editMode]);
+
+  useEffect(() => {
+    if (!containerRef.current || editMode) return;
+    const onClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (target.tagName.toLowerCase() === "mark") {
+        const id = target.getAttribute("data-highlight-id");
+        if (id) {
+          onRemoveHighlight(id);
+        }
+      }
+    };
+    const node = containerRef.current;
+    node.addEventListener("click", onClick);
+    return () => node.removeEventListener("click", onClick);
+  }, [onRemoveHighlight, editMode]);
 
   useEffect(() => {
     setDraft(file.content);
@@ -87,7 +160,7 @@ export function MarkdownViewer({
     return () => {
       ctx.kill();
     };
-  }, [file.id]);
+  }, [activeChunk.id, file.id]);
 
   // Autosave draft to parent
   useEffect(() => {
@@ -96,28 +169,13 @@ export function MarkdownViewer({
     return () => clearTimeout(t);
   }, [draft, editMode, file.id, onContentChange]);
 
-  // Scroll to target
+  // Reset to top only when the chapter changes
   useEffect(() => {
-    if (!scrollTargetId) return;
-    const el = document.getElementById(scrollTargetId);
-    if (el) {
-      const y = el.getBoundingClientRect().top + window.scrollY - 80;
-      window.scrollTo({ top: y, behavior: "smooth" });
-      el.classList.add("docs-flash");
-      setTimeout(() => el.classList.remove("docs-flash"), 1600);
-    }
-  }, [scrollTargetId, file.id]);
-
-  // Reset to top only when the chapter changes with no pending target. Must NOT
-  // depend on scrollTargetId: clearing the target after a jump would otherwise
-  // yank the reader back to the top ~100ms after landing on the occurrence.
-  useEffect(() => {
-    if (!scrollTargetId) window.scrollTo({ top: 0 });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [file.id]);
+    window.scrollTo({ top: 0 });
+  }, [activeChunk.id, file.id]);
 
   // Scrollspy, ambient progress, and earned completion. Completion is reported
-  // by how far the reader has actually scrolled — never by clicking a heading.
+  // by how far the reader has actually scrolled.
   useEffect(() => {
     const onScroll = () => {
       const doc = document.documentElement;
@@ -127,22 +185,11 @@ export function MarkdownViewer({
       setProgress(frac * 100);
       setShowTop(scrolled > 400);
       onReadProgress(frac);
-
-      const headings = containerRef.current?.querySelectorAll<HTMLElement>(
-        "h1, h2, h3, h4, h5, h6",
-      );
-      if (!headings) return;
-      let current: string | null = null;
-      for (const h of Array.from(headings)) {
-        if (h.getBoundingClientRect().top < 120) current = h.id;
-        else break;
-      }
-      onActiveHeading(current);
     };
     onScroll();
     window.addEventListener("scroll", onScroll, { passive: true });
     return () => window.removeEventListener("scroll", onScroll);
-  }, [file.id, onActiveHeading, onReadProgress, editMode]);
+  }, [file.id, activeChunk.id, onReadProgress, editMode]);
 
   // Save shortcut
   useEffect(() => {
@@ -157,10 +204,10 @@ export function MarkdownViewer({
   }, [draft, editMode, file.id, onContentChange]);
 
   const stats = useMemo(() => {
-    const words = file.content.trim().split(/\s+/).filter(Boolean).length;
+    const words = activeChunk.content.trim().split(/\s+/).filter(Boolean).length;
     const readingMin = Math.max(1, Math.round(words / 220));
     return { words, readingMin };
-  }, [file.content]);
+  }, [activeChunk.content]);
 
   const highlightRegex = useMemo(() => {
     if (!highlightQuery) return null;
@@ -256,6 +303,30 @@ export function MarkdownViewer({
 
   return (
     <>
+      {selectionRect && !editMode && (
+        <div
+          className="fixed z-50 flex gap-1 rounded-md bg-popover p-1 shadow-md border border-border"
+          style={{
+            top: selectionRect.top - 40,
+            left: selectionRect.left + selectionRect.width / 2,
+            transform: "translateX(-50%)",
+          }}
+        >
+          {["#fde047", "#86efac", "#93c5fd", "#f9a8d4"].map((color) => (
+            <button
+              key={color}
+              className="h-6 w-6 rounded-full border border-border cursor-pointer hover:scale-110 transition-transform"
+              style={{ backgroundColor: color }}
+              onClick={() => {
+                onAddHighlight(selectedText, color);
+                window.getSelection()?.removeAllRanges();
+                setSelectionRect(null);
+              }}
+            />
+          ))}
+        </div>
+      )}
+
       <div
         className="fixed left-0 right-0 top-16 z-40 h-0.5 bg-primary/80 transition-transform origin-left"
         style={{ transform: `scaleX(${progress / 100})` }}
@@ -269,18 +340,19 @@ export function MarkdownViewer({
         <article ref={containerRef} className="docs-prose mx-auto min-w-0 flex-1">
           <div className="mb-8 flex flex-wrap items-center justify-between gap-3">
             <div className="min-w-0">
-              {/* Chapter eyebrow: orientation — which chapter, of how many */}
               <div className="flex items-center gap-2">
                 <span className="text-xs font-semibold uppercase tracking-[0.14em] text-primary">
-                  Chapter {chapterNumber}
-                  <span className="text-muted-foreground"> of {totalChapters}</span>
+                  {stripExt(file.name)}
                 </span>
-                {isComplete && (
+              </div>
+              <h1 className="mt-2 text-3xl font-extrabold tracking-tight text-foreground sm:text-4xl">
+                {activeChunk.title}
+              </h1>
+              {isComplete && (
                   <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">
                     <Check className="h-3 w-3" strokeWidth={3} /> Read
                   </span>
                 )}
-              </div>
               <div className="mt-1.5 flex items-center gap-3 text-xs text-muted-foreground">
                 <span className="truncate">{stripExt(file.name)}</span>
                 <span>·</span>
@@ -289,20 +361,34 @@ export function MarkdownViewer({
                 </span>
               </div>
             </div>
-            <button
-              onClick={() => setEditMode((e) => !e)}
-              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground active:scale-95"
-            >
-              {editMode ? (
-                <>
-                  <Eye className="h-3.5 w-3.5" /> Preview
-                </>
-              ) : (
-                <>
-                  <Pencil className="h-3.5 w-3.5" /> Edit
-                </>
-              )}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={onToggleBookmark}
+                aria-label={isBookmarked ? "Remove bookmark" : "Bookmark this chapter"}
+                title={isBookmarked ? "Remove bookmark" : "Bookmark this chapter"}
+                className={`inline-flex items-center justify-center rounded-md border border-border bg-background p-2 transition-colors hover:border-primary/40 active:scale-95 ${
+                  isBookmarked ? "text-primary" : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <Bookmark
+                  className={`h-3.5 w-3.5 ${isBookmarked ? "fill-primary" : ""}`}
+                />
+              </button>
+              <button
+                onClick={() => setEditMode((e) => !e)}
+                className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground active:scale-95"
+              >
+                {editMode ? (
+                  <>
+                    <Eye className="h-3.5 w-3.5" /> Preview
+                  </>
+                ) : (
+                  <>
+                    <Pencil className="h-3.5 w-3.5" /> Edit
+                  </>
+                )}
+              </button>
+            </div>
           </div>
 
           {editMode ? (
@@ -337,28 +423,43 @@ export function MarkdownViewer({
               ]}
               components={components}
             >
-              {file.content}
+              {activeChunk.content}
             </ReactMarkdown>
           )}
 
           {/* Natural stopping point — quiet acknowledgement, clear next step */}
           {!editMode && (
             <div className="mt-16 border-t border-border pt-8">
-              {isComplete && (
+              {isLastChunk && (
                 <div className="mb-5 flex items-center gap-2 text-sm text-muted-foreground">
                   <span className="flex h-5 w-5 items-center justify-center rounded-full bg-primary text-primary-foreground">
                     <Check className="h-3 w-3" strokeWidth={3} />
                   </span>
                   <span>
                     <span className="font-medium text-foreground">{stripExt(file.name)}</span>{" "}
-                    complete
+                    Documentation complete
                   </span>
                 </div>
               )}
 
-              {nextFile ? (
+              {nextChunk ? (
                 <button
-                  onClick={() => onNavFile(nextFile.id)}
+                  onClick={() => onNav(file.id, nextChunk.id)}
+                  className="group flex w-full items-center justify-between gap-4 rounded-xl border border-border p-5 text-left transition-all hover:border-primary/50 hover:bg-accent/40"
+                >
+                  <span className="min-w-0">
+                    <span className="block text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      Next topic
+                    </span>
+                    <span className="mt-1 block truncate text-base font-semibold text-foreground">
+                      {nextChunk.title}
+                    </span>
+                  </span>
+                  <ArrowRight className="h-5 w-5 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-foreground" />
+                </button>
+              ) : nextFile ? (
+                <button
+                  onClick={() => onNav(nextFile.id, null)}
                   className="group flex w-full items-center justify-between gap-4 rounded-xl border border-border p-5 text-left transition-all hover:border-primary/50 hover:bg-accent/40"
                 >
                   <span className="min-w-0">
@@ -395,15 +496,25 @@ export function MarkdownViewer({
                 </div>
               )}
 
-              {prevFile && (
-                <button
-                  onClick={() => onNavFile(prevFile.id)}
-                  className="group mt-3 inline-flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
-                >
-                  <ArrowLeft className="h-4 w-4 transition-transform group-hover:-translate-x-0.5" />
-                  Previous: {stripExt(prevFile.name)}
-                </button>
-              )}
+              <div className="mt-4 flex flex-col gap-2 items-start">
+                {prevChunk ? (
+                  <button
+                    onClick={() => onNav(file.id, prevChunk.id)}
+                    className="group inline-flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
+                  >
+                    <ArrowLeft className="h-4 w-4 transition-transform group-hover:-translate-x-0.5" />
+                    Previous topic: {prevChunk.title}
+                  </button>
+                ) : prevFile ? (
+                  <button
+                    onClick={() => onNav(prevFile.id, null)}
+                    className="group inline-flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
+                  >
+                    <ArrowLeft className="h-4 w-4 transition-transform group-hover:-translate-x-0.5" />
+                    Previous chapter: {stripExt(prevFile.name)}
+                  </button>
+                ) : null}
+              </div>
             </div>
           )}
         </article>

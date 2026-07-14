@@ -6,14 +6,23 @@ export interface MdHeading {
   children: MdHeading[];
 }
 
+export interface MdChunk {
+  id: string;
+  title: string;
+  content: string;
+}
+
 export interface MdFile {
   id: string;
   name: string;
   content: string;
   headings: MdHeading[];
+  subtopics: MdChunk[];
 }
 
 import GithubSlugger, { slug } from "github-slugger";
+
+export const stripExt = (name: string) => name.replace(/\.(md|markdown|mdx|txt)$/i, "");
 
 // Stateless slug matching rehype-slug (github-slugger) so sidebar/ToC ids
 // line up exactly with the DOM ids rendered by rehypeSlug. Local ad-hoc
@@ -68,4 +77,60 @@ export function flattenHeadings(headings: MdHeading[]): MdHeading[] {
   };
   walk(headings);
   return out;
+}
+
+export function splitIntoSubtopics(content: string, fileName: string): MdChunk[] {
+  const lines = content.split("\n");
+  const chunks: MdChunk[] = [];
+  const slugger = new GithubSlugger();
+  
+  let currentChunk: string[] = [];
+  let currentId = "preamble";
+  let currentTitle = stripExt(fileName);
+  let inCode = false;
+
+  for (const line of lines) {
+    if (line.trim().startsWith("```")) {
+      inCode = !inCode;
+      currentChunk.push(line);
+      continue;
+    }
+    
+    // Split on H1 and H2 (level 1 and 2)
+    if (!inCode) {
+      const m = /^(#{1,2})\s+(.+?)\s*#*\s*$/.exec(line);
+      if (m) {
+        if (currentChunk.some(l => l.trim().length > 0)) {
+          chunks.push({
+            id: currentId,
+            title: currentTitle,
+            content: currentChunk.join("\n")
+          });
+        } else if (chunks.length > 0) {
+           chunks.push({
+            id: currentId,
+            title: currentTitle,
+            content: ""
+          });
+        }
+        
+        currentChunk = [line];
+        currentTitle = m[2].trim();
+        currentId = slugger.slug(currentTitle || "section");
+        continue;
+      }
+    }
+    
+    currentChunk.push(line);
+  }
+  
+  if (currentChunk.some(l => l.trim().length > 0) || chunks.length === 0) {
+    chunks.push({
+      id: currentId,
+      title: currentTitle,
+      content: currentChunk.join("\n")
+    });
+  }
+  
+  return chunks;
 }

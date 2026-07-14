@@ -9,8 +9,14 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as MdReaderRouteImport } from './routes/md-reader'
 import { Route as IndexRouteImport } from './routes/index'
 
+const MdReaderRoute = MdReaderRouteImport.update({
+  id: '/md-reader',
+  path: '/md-reader',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
@@ -19,28 +25,39 @@ const IndexRoute = IndexRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/md-reader': typeof MdReaderRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/md-reader': typeof MdReaderRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/md-reader': typeof MdReaderRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/'
+  fullPaths: '/' | '/md-reader'
   fileRoutesByTo: FileRoutesByTo
-  to: '/'
-  id: '__root__' | '/'
+  to: '/' | '/md-reader'
+  id: '__root__' | '/' | '/md-reader'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  MdReaderRoute: typeof MdReaderRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/md-reader': {
+      id: '/md-reader'
+      path: '/md-reader'
+      fullPath: '/md-reader'
+      preLoaderRoute: typeof MdReaderRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/': {
       id: '/'
       path: '/'
@@ -53,6 +70,7 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  MdReaderRoute: MdReaderRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

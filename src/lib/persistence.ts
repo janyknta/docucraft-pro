@@ -22,12 +22,17 @@ export interface PersistedUI {
   scrollTop: number;
 }
 
+import type { Highlight } from "./dom-highlighter";
+
 export interface WorkspaceRecord {
   id: string;
   name: string;
   createdAt: number;
   updatedAt: number;
   files: PersistedFile[];
+  // Bookmarked file ids, shown on the home page.
+  bookmarks: string[];
+  highlights?: Highlight[];
   ui: PersistedUI;
 }
 
@@ -101,6 +106,8 @@ export function newWorkspaceRecord(name: string): WorkspaceRecord {
     createdAt: now,
     updatedAt: now,
     files: [],
+    bookmarks: [],
+    highlights: [],
     ui: emptyUI(),
   };
 }
@@ -112,10 +119,12 @@ export type ThemePref = "light" | "dark" | "system";
 export interface Prefs {
   theme: ThemePref;
   lastWorkspaceId: string | null;
+  // The reader's name, asked once and remembered for personalized greetings.
+  name: string | null;
 }
 
 const PREFS_KEY = "docucraft:prefs";
-const DEFAULT_PREFS: Prefs = { theme: "system", lastWorkspaceId: null };
+const DEFAULT_PREFS: Prefs = { theme: "system", lastWorkspaceId: null, name: null };
 
 export function loadPrefs(): Prefs {
   if (typeof localStorage === "undefined") return { ...DEFAULT_PREFS };
@@ -162,6 +171,15 @@ export function parseWorkspaceImport(json: string): WorkspaceRecord {
         name: typeof f.name === "string" ? f.name : "untitled.md",
         content: f.content,
       })),
-    ui: { ...emptyUI(), ...(w.ui ?? {}) },
+    bookmarks: Array.isArray(w.bookmarks)
+      ? w.bookmarks.filter((b: any) => typeof b === "string")
+      : [],
+    highlights: Array.isArray(w.highlights) ? w.highlights : [],
+    ui: {
+      activeFileId: typeof w.ui?.activeFileId === "string" ? w.ui.activeFileId : null,
+      expanded: typeof w.ui?.expanded === "object" ? w.ui.expanded : {},
+      sidebarCollapsed: typeof w.ui?.sidebarCollapsed === "boolean" ? w.ui.sidebarCollapsed : false,
+      scrollTop: typeof w.ui?.scrollTop === "number" ? w.ui.scrollTop : 0,
+    },
   };
 }
