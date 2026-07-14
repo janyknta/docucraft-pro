@@ -470,7 +470,21 @@ export function DocsApp() {
     if (!clean) return;
     savePrefs({ name: clean });
     setUserName(clean);
-  }, []);
+    // If the current workspace still has the generic default name, personalize it.
+    const currentId = workspaceIdRef.current;
+    if (currentId && /^(my workspace|workspace \d+)$/i.test(workspaceNameRef.current)) {
+      const personalized = `${clean}'s Workspace`;
+      workspaceNameRef.current = personalized;
+      void (async () => {
+        const ws = await persistence.getWorkspace(currentId);
+        if (ws) {
+          ws.name = personalized;
+          await persistence.putWorkspace(ws);
+          await refreshWorkspaceList();
+        }
+      })();
+    }
+  }, [refreshWorkspaceList]);
 
   const openFromHome = useCallback(
     (fileId: string, subtopicId?: string) => {
@@ -607,6 +621,20 @@ export function DocsApp() {
     [refreshWorkspaceList],
   );
 
+  const clearAllStorage = useCallback(async () => {
+    try {
+      const list = await persistence.listWorkspaces().catch(() => [] as WorkspaceRecord[]);
+      await Promise.all(list.map((w) => persistence.deleteWorkspace(w.id)));
+      try {
+        localStorage.clear();
+      } catch {
+        /* ignore */
+      }
+    } finally {
+      window.location.reload();
+    }
+  }, []);
+
   // ---- home page data ----
   const recentItems = files
     .map((f) => ({ f, at: progress[f.name]?.lastReadAt ?? 0 }))
@@ -696,15 +724,11 @@ export function DocsApp() {
         />
         <HomePage
           userName={userName}
-          isFirstVisit={firstVisitRef.current}
           onSubmitName={submitName}
-          resume={resume}
           recent={recentItems}
-          workspaces={workspaceItems}
           bookmarks={bookmarkItems}
           hasFiles={files.length > 0}
           onOpenFile={openFromHome}
-          onSwitchWorkspace={openWorkspaceFromHome}
           onUpload={() => inputRef.current?.click()}
         />
         <input
@@ -782,6 +806,11 @@ export function DocsApp() {
               theme={theme}
               onCycleTheme={cycleTheme}
               bookmarks={bookmarkItems}
+              currentWorkspaceName={workspaces.find((w) => w.id === workspaceId)?.name ?? ""}
+              canDeleteWorkspace={workspaces.length > 1}
+              onRenameCurrentWorkspace={(name) => workspaceId && renameWorkspace(workspaceId, name)}
+              onDeleteCurrentWorkspace={() => workspaceId && deleteWorkspace(workspaceId)}
+              onClearStorage={clearAllStorage}
             />
           </div>
           {!sidebarCollapsed && (
@@ -837,6 +866,11 @@ export function DocsApp() {
                   theme={theme}
                   onCycleTheme={cycleTheme}
                   bookmarks={bookmarkItems}
+                  currentWorkspaceName={workspaces.find((w) => w.id === workspaceId)?.name ?? ""}
+                  canDeleteWorkspace={workspaces.length > 1}
+                  onRenameCurrentWorkspace={(name) => workspaceId && renameWorkspace(workspaceId, name)}
+                  onDeleteCurrentWorkspace={() => workspaceId && deleteWorkspace(workspaceId)}
+                  onClearStorage={clearAllStorage}
                 />
               </div>
             </div>

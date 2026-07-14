@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, Plus, Download, Upload, Trash2, Check, FolderOpen, Pencil } from "lucide-react";
+import { ChevronDown, Plus, Download, Upload, Trash2, Check, FolderOpen } from "lucide-react";
 
 interface WorkspaceLite {
   id: string;
@@ -79,20 +79,8 @@ export function WorkspaceMenu({
                   />
                   <span className="truncate">{w.name}</span>
                 </button>
-                <div className="mr-1 flex items-center opacity-0 transition-opacity group-hover:opacity-100">
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      const newName = window.prompt("Rename workspace to:", w.name);
-                      if (newName && newName !== w.name) onRename(w.id, newName);
-                    }}
-                    className="rounded p-1"
-                    aria-label={`Rename ${w.name}`}
-                    title="Rename workspace"
-                  >
-                    <Pencil className="h-3.5 w-3.5 text-muted-foreground hover:text-foreground" />
-                  </button>
-                  {workspaces.length > 1 && (
+                {workspaces.length > 1 && (
+                  <div className="mr-1 flex items-center opacity-0 transition-opacity group-hover:opacity-100">
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
@@ -104,8 +92,8 @@ export function WorkspaceMenu({
                     >
                       <Trash2 className="h-3.5 w-3.5 text-muted-foreground hover:text-destructive" />
                     </button>
-                  )}
-                </div>
+                  </div>
+                )}
               </div>
             ))}
           </div>
