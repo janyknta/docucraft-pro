@@ -866,6 +866,11 @@ export function DocsApp() {
                   theme={theme}
                   onCycleTheme={cycleTheme}
                   bookmarks={bookmarkItems}
+                  currentWorkspaceName={workspaces.find((w) => w.id === workspaceId)?.name ?? ""}
+                  canDeleteWorkspace={workspaces.length > 1}
+                  onRenameCurrentWorkspace={(name) => workspaceId && renameWorkspace(workspaceId, name)}
+                  onDeleteCurrentWorkspace={() => workspaceId && deleteWorkspace(workspaceId)}
+                  onClearStorage={clearAllStorage}
                 />
               </div>
             </div>
