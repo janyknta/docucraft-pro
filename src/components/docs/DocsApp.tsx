@@ -232,7 +232,7 @@ export function DocsApp() {
     setExpanded(ws.ui?.expanded ?? {});
     setSidebarCollapsed(!!ws.ui?.sidebarCollapsed);
     setBookmarks(ws.bookmarks ?? []);
-    setHighlights(ws.highlights ?? []);
+    setHighlights((ws.highlights ?? []).filter((h) => typeof h.text === "string"));
     setWorkspaceId(ws.id);
     workspaceIdRef.current = ws.id;
     workspaceNameRef.current = ws.name;
@@ -413,11 +413,21 @@ export function DocsApp() {
   );
 
   const addHighlight = useCallback(
-    (text: string, color: string, fileId: string) => {
+    (hl: Omit<Highlight, "id" | "fileId">, fileId: string) => {
       setHighlights((prev) => [
         ...prev,
-        { id: crypto.randomUUID(), fileId, text, color },
+        { id: crypto.randomUUID(), fileId, ...hl },
       ]);
+      markDirty();
+    },
+    [markDirty],
+  );
+
+  const updateHighlight = useCallback(
+    (id: string, patch: Partial<{ color: string; label: string }>) => {
+      setHighlights((prev) =>
+        prev.map((h) => (h.id === id ? { ...h, ...patch } : h)),
+      );
       markDirty();
     },
     [markDirty],
@@ -463,9 +473,9 @@ export function DocsApp() {
   }, []);
 
   const openFromHome = useCallback(
-    (fileId: string) => {
+    (fileId: string, subtopicId?: string) => {
       navigate({ to: "/md-reader" });
-      handleSelect(fileId);
+      handleSelect(fileId, subtopicId);
     },
     // handleSelect is stable enough for our needs; intentionally minimal deps.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -851,8 +861,9 @@ export function DocsApp() {
               onReadProgress={handleReadProgress}
               isBookmarked={!!activeFile && !!activeHeadingId && bookmarks.includes(`${activeFile.id}#${activeHeadingId}`)}
               onToggleBookmark={() => activeFile && activeHeadingId && toggleBookmark(activeFile.id, activeHeadingId)}
-              highlights={highlights.filter(h => h.fileId === activeFile.id)}
-              onAddHighlight={(text, color) => addHighlight(text, color, activeFile.id)}
+              highlights={highlights.filter((h) => h.fileId === activeFile.id)}
+              onAddHighlight={(hl) => addHighlight(hl, activeFile.id)}
+              onUpdateHighlight={updateHighlight}
               onRemoveHighlight={removeHighlight}
             />
           )}

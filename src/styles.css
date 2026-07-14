@@ -276,3 +276,13 @@
 
 /* Mermaid diagrams render responsively inside the pan/zoom stage */
 .docs-mermaid svg { max-width: 100%; height: auto; display: block; }
+
+/* Persistent highlights via the CSS Custom Highlight API. Rendered without
+   mutating the DOM, so they survive React re-renders and span multiple nodes. */
+::highlight(dc-hl-0) { background-color: #fde047; color: #0a0a0a; }
+::highlight(dc-hl-1) { background-color: #86efac; color: #0a0a0a; }
+::highlight(dc-hl-2) { background-color: #93c5fd; color: #0a0a0a; }
+::highlight(dc-hl-3) { background-color: #f9a8d4; color: #0a0a0a; }
+::highlight(dc-hl-4) { background-color: #fdba74; color: #0a0a0a; }
+::highlight(dc-hl-5) { background-color: #d8b4fe; color: #0a0a0a; }
+::highlight(dc-query) { background-color: color-mix(in oklab, var(--primary) 30%, transparent); }

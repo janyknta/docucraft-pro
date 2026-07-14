@@ -23,13 +23,17 @@ import {
   Lightbulb,
   AlertOctagon,
   StickyNote,
+  Tag,
+  Trash2,
+  X,
 } from "lucide-react";
 import type { MdFile } from "@/lib/markdown-utils";
 import { slugify } from "@/lib/markdown-utils";
 import { Mermaid } from "./Mermaid";
 import { detectEmbed, EmbedFrame, isVideoUrl, VideoPlayer } from "@/lib/media-embeds";
 import { Lightbox } from "./Lightbox";
-import { applyHighlightsToDOM, type Highlight } from "@/lib/dom-highlighter";
+import { HL_COLORS, hlGroup, type Highlight } from "@/lib/dom-highlighter";
+import { getSelectionOffsets, buildRange, offsetFromPoint, firstTextRange } from "@/lib/text-offsets";
 import { splitIntoSubtopics } from "@/lib/markdown-utils";
 
 interface Props {
@@ -49,7 +53,8 @@ interface Props {
   isBookmarked: boolean;
   onToggleBookmark: () => void;
   highlights: Highlight[];
-  onAddHighlight: (text: string, color: string) => void;
+  onAddHighlight: (hl: Omit<Highlight, "id" | "fileId">) => void;
+  onUpdateHighlight: (id: string, patch: Partial<Pick<Highlight, "color" | "label">>) => void;
   onRemoveHighlight: (id: string) => void;
 }
 
@@ -73,6 +78,7 @@ export function MarkdownViewer({
   onToggleBookmark,
   highlights,
   onAddHighlight,
+  onUpdateHighlight,
   onRemoveHighlight,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -92,57 +98,109 @@ export function MarkdownViewer({
   const prevChunk = chunkIndex > 0 ? allChunks[chunkIndex - 1] : null;
   const nextChunk = chunkIndex >= 0 && chunkIndex < allChunks.length - 1 ? allChunks[chunkIndex + 1] : null;
 
+  const renderContent = useMemo(() => {
+    return activeChunk.content.replace(/^(#{1,2})\s+(.+?)\s*#*\s*\n?/, "");
+  }, [activeChunk.content]);
+
   const [lightbox, setLightbox] = useState<{ src: string; alt?: string } | null>(null);
 
-  const [selectionRect, setSelectionRect] = useState<DOMRect | null>(null);
-  const [selectedText, setSelectedText] = useState("");
+  // Highlight menu: "create" from a fresh selection, or "edit" from clicking an
+  // existing highlight. A single popover serves both. Detached from the live
+  // Selection so typing a label doesn't dismiss it.
+  const contentRef = useRef<HTMLDivElement>(null);
+  type HlMenu =
+    | { mode: "create"; text: string; start: number; end: number; x: number; y: number; label: string }
+    | { mode: "edit"; hl: Highlight; x: number; y: number; label: string };
+  const [menu, setMenu] = useState<HlMenu | null>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
 
+  const openCreateMenu = () => {
+    if (editMode || !contentRef.current) return;
+    const sel = getSelectionOffsets(contentRef.current);
+    if (!sel) return;
+    const range = window.getSelection()?.getRangeAt(0);
+    const r = range?.getBoundingClientRect();
+    setMenu({
+      mode: "create",
+      text: sel.text,
+      start: sel.start,
+      end: sel.end,
+      x: r ? r.left + r.width / 2 : window.innerWidth / 2,
+      y: r ? r.top : 120,
+      label: "",
+    });
+  };
+
+  const openEditMenu = (hl: Highlight, x: number, y: number) => {
+    setMenu({ mode: "edit", hl, x, y, label: hl.label ?? "" });
+  };
+
+  // Paint persistent highlights with the CSS Custom Highlight API — no DOM
+  // mutation, so React re-renders never wipe them and cross-node selections
+  // highlight correctly. Groups map to ::highlight(dc-hl-N) rules in the CSS.
   useEffect(() => {
-    const handleSelection = () => {
-      if (editMode) {
-        setSelectionRect(null);
-        return;
-      }
-      const selection = window.getSelection();
-      if (!selection || selection.isCollapsed || !selection.toString().trim()) {
-        setSelectionRect(null);
-        return;
-      }
+    const container = contentRef.current;
+    const CSSH = (typeof CSS !== "undefined" && (CSS as any).highlights) as
+      | Map<string, any>
+      | undefined;
+    if (!container || !CSSH || typeof (window as any).Highlight === "undefined") return;
 
-      const range = selection.getRangeAt(0);
-      if (containerRef.current && containerRef.current.contains(range.commonAncestorContainer)) {
-        setSelectionRect(range.getBoundingClientRect());
-        setSelectedText(selection.toString());
-      } else {
-        setSelectionRect(null);
-      }
-    };
-
-    document.addEventListener("selectionchange", handleSelection);
-    return () => document.removeEventListener("selectionchange", handleSelection);
-  }, [editMode]);
-
-  useEffect(() => {
-    if (containerRef.current && !editMode) {
-      applyHighlightsToDOM(containerRef.current, highlights);
+    const groups: Record<string, Range[]> = {};
+    for (const hl of highlights) {
+      if (hl.subtopicId && hl.subtopicId !== activeChunk.id) continue;
+      const range =
+        typeof hl.start === "number" && typeof hl.end === "number"
+          ? buildRange(container, hl.start, hl.end)
+          : firstTextRange(container, hl.text);
+      if (!range || range.collapsed) continue;
+      const g = hlGroup(hl.color);
+      (groups[g] ||= []).push(range);
     }
-  }, [file.content, highlights, editMode]);
 
-  useEffect(() => {
-    if (!containerRef.current || editMode) return;
-    const onClick = (e: MouseEvent) => {
-      const target = e.target as HTMLElement;
-      if (target.tagName.toLowerCase() === "mark") {
-        const id = target.getAttribute("data-highlight-id");
-        if (id) {
-          onRemoveHighlight(id);
-        }
-      }
+    HL_COLORS.forEach((c) => CSSH.delete(hlGroup(c)));
+    for (const [g, ranges] of Object.entries(groups)) {
+      CSSH.set(g, new (window as any).Highlight(...ranges));
+    }
+    return () => {
+      HL_COLORS.forEach((c) => CSSH.delete(hlGroup(c)));
     };
-    const node = containerRef.current;
-    node.addEventListener("click", onClick);
-    return () => node.removeEventListener("click", onClick);
-  }, [onRemoveHighlight, editMode]);
+  }, [highlights, activeChunk.id, renderContent, editMode]);
+
+  // Click inside the content: if the click lands on an existing highlight, open
+  // its edit popover (CSS highlights aren't DOM nodes, so we hit-test offsets).
+  const onContentClick = (e: React.MouseEvent) => {
+    if (editMode || !contentRef.current) return;
+    if (!window.getSelection()?.isCollapsed) return; // a drag-select, not a click
+    const off = offsetFromPoint(contentRef.current, e.clientX, e.clientY);
+    if (off == null) return;
+    const hit = highlights.find(
+      (h) =>
+        (!h.subtopicId || h.subtopicId === activeChunk.id) &&
+        typeof h.start === "number" &&
+        typeof h.end === "number" &&
+        off >= h.start &&
+        off < h.end,
+    );
+    if (hit) openEditMenu(hit, e.clientX, e.clientY);
+  };
+
+  // Close the menu on outside click / Escape (but keep it open while the reader
+  // interacts with the popover itself).
+  useEffect(() => {
+    if (!menu) return;
+    const onDown = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenu(null);
+    };
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setMenu(null);
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [menu]);
+
+  useEffect(() => setMenu(null), [activeChunk.id, file.id, editMode]);
 
   useEffect(() => {
     setDraft(file.content);
@@ -209,17 +267,16 @@ export function MarkdownViewer({
     return { words, readingMin };
   }, [activeChunk.content]);
 
-  const highlightRegex = useMemo(() => {
-    if (!highlightQuery) return null;
-    const escaped = highlightQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return new RegExp(`(${escaped})`, "gi");
-  }, [highlightQuery]);
-
-  const highlightText = (text: string) => {
-    if (!highlightRegex) return text;
-    const parts = text.split(highlightRegex);
+  // Search-query highlighting stays a lightweight React wrap. Persistent
+  // highlights are painted via the CSS Custom Highlight API instead (see the
+  // effect below) so they survive re-renders and span multiple elements.
+  const highlightText = (text: string): any => {
+    const q = highlightQuery?.trim();
+    if (!q || !text) return text;
+    const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const parts = text.split(new RegExp(`(${escaped})`, "gi"));
     return parts.map((p, i) =>
-      highlightRegex.test(p) ? (
+      p.toLowerCase() === q.toLowerCase() ? (
         <mark key={i} className="rounded bg-primary/25 px-0.5 text-foreground">
           {p}
         </mark>
@@ -298,32 +355,132 @@ export function MarkdownViewer({
       th: (p: any) => <th {...p}>{walkChildren(p.children)}</th>,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [highlightRegex],
+    [highlights, highlightQuery],
   );
 
   return (
     <>
-      {selectionRect && !editMode && (
+      {menu && !editMode && (
         <div
-          className="fixed z-50 flex gap-1 rounded-md bg-popover p-1 shadow-md border border-border"
-          style={{
-            top: selectionRect.top - 40,
-            left: selectionRect.left + selectionRect.width / 2,
-            transform: "translateX(-50%)",
-          }}
+          ref={menuRef}
+          className="fixed z-[60] w-64 -translate-x-1/2 rounded-lg border border-border bg-popover p-2 shadow-xl"
+          style={{ top: Math.max(56, menu.y - 12), left: menu.x }}
+          onMouseDown={(e) => e.stopPropagation()}
         >
-          {["#fde047", "#86efac", "#93c5fd", "#f9a8d4"].map((color) => (
+          <div className="mb-2 flex items-center justify-between px-1">
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              {menu.mode === "create" ? "Highlight" : "Edit highlight"}
+            </span>
             <button
-              key={color}
-              className="h-6 w-6 rounded-full border border-border cursor-pointer hover:scale-110 transition-transform"
-              style={{ backgroundColor: color }}
-              onClick={() => {
-                onAddHighlight(selectedText, color);
-                window.getSelection()?.removeAllRanges();
-                setSelectionRect(null);
+              onClick={() => setMenu(null)}
+              className="rounded p-0.5 text-muted-foreground hover:text-foreground"
+              aria-label="Close"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+
+          <div className="mb-2 flex items-center gap-1.5 px-1">
+            {HL_COLORS.map((color) => {
+              const active = menu.mode === "edit" && menu.hl.color === color;
+              return (
+                <button
+                  key={color}
+                  aria-label={`Highlight ${color}`}
+                  className={`h-6 w-6 rounded-full transition-transform hover:scale-110 ${
+                    active ? "ring-2 ring-foreground ring-offset-1 ring-offset-popover" : "border border-border/60"
+                  }`}
+                  style={{ backgroundColor: color }}
+                  onClick={() => {
+                    if (menu.mode === "create") {
+                      onAddHighlight({
+                        text: menu.text,
+                        color,
+                        label: menu.label.trim() || undefined,
+                        subtopicId: activeChunk.id,
+                        start: menu.start,
+                        end: menu.end,
+                      });
+                      window.getSelection()?.removeAllRanges();
+                    } else {
+                      onUpdateHighlight(menu.hl.id, { color });
+                    }
+                    setMenu(null);
+                  }}
+                />
+              );
+            })}
+          </div>
+
+          <div className="mb-2 flex items-center gap-1.5 rounded-md border border-border bg-background px-2">
+            <Tag className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            <input
+              value={menu.label}
+              onChange={(e) => setMenu((m) => (m ? { ...m, label: e.target.value } : m))}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  if (menu.mode === "create") {
+                    onAddHighlight({
+                      text: menu.text,
+                      color: HL_COLORS[0],
+                      label: menu.label.trim() || undefined,
+                      subtopicId: activeChunk.id,
+                      start: menu.start,
+                      end: menu.end,
+                    });
+                    window.getSelection()?.removeAllRanges();
+                  } else {
+                    onUpdateHighlight(menu.hl.id, { label: menu.label.trim() || undefined });
+                  }
+                  setMenu(null);
+                }
               }}
+              placeholder="Add a label (optional)"
+              className="w-full bg-transparent py-1.5 text-xs outline-none placeholder:text-muted-foreground"
             />
-          ))}
+          </div>
+
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => {
+                navigator.clipboard.writeText(menu.mode === "create" ? menu.text : menu.hl.text);
+                setMenu(null);
+              }}
+              className="flex flex-1 items-center justify-center gap-1.5 rounded-md border border-border px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <Copy className="h-3.5 w-3.5" /> Copy
+            </button>
+            {menu.mode === "edit" && (
+              <button
+                onClick={() => {
+                  onRemoveHighlight(menu.hl.id);
+                  setMenu(null);
+                }}
+                className="flex flex-1 items-center justify-center gap-1.5 rounded-md border border-border px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:border-destructive/40 hover:text-destructive"
+              >
+                <Trash2 className="h-3.5 w-3.5" /> Remove
+              </button>
+            )}
+            {menu.mode === "create" && (
+              <button
+                onClick={() => {
+                  onAddHighlight({
+                    text: menu.text,
+                    color: HL_COLORS[0],
+                    label: menu.label.trim() || undefined,
+                    subtopicId: activeChunk.id,
+                    start: menu.start,
+                    end: menu.end,
+                  });
+                  window.getSelection()?.removeAllRanges();
+                  setMenu(null);
+                }}
+                className="flex flex-1 items-center justify-center gap-1.5 rounded-md bg-foreground px-2 py-1.5 text-xs font-medium text-background transition-opacity hover:opacity-90"
+              >
+                Highlight
+              </button>
+            )}
+          </div>
         </div>
       )}
 
@@ -337,57 +494,59 @@ export function MarkdownViewer({
       <div
         className={`mx-auto flex w-full max-w-4xl gap-8 px-6 py-10 md:px-10 md:py-16`}
       >
-        <article ref={containerRef} className="docs-prose mx-auto min-w-0 flex-1">
-          <div className="mb-8 flex flex-wrap items-center justify-between gap-3">
-            <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-semibold uppercase tracking-[0.14em] text-primary">
-                  {stripExt(file.name)}
+        <article
+          ref={containerRef}
+          onMouseUp={openCreateMenu}
+          className="docs-prose mx-auto min-w-0 flex-1"
+        >
+          <div className="mb-8">
+            <div className="mb-2 flex flex-wrap items-center gap-2">
+              <span className="text-xs font-semibold uppercase tracking-[0.14em] text-primary">
+                {stripExt(file.name)}
+              </span>
+              <span className="inline-flex items-center gap-1 rounded-full bg-muted/50 px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
+                <Clock className="h-3 w-3" /> ≈ {stats.readingMin} min read
+              </span>
+              {progress > 90 && (
+                <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">
+                  <Check className="h-3 w-3" strokeWidth={3} /> Read
                 </span>
-              </div>
-              <h1 className="mt-2 text-3xl font-extrabold tracking-tight text-foreground sm:text-4xl">
+              )}
+            </div>
+
+            <div className="flex items-start justify-between gap-4">
+              <h1 className="min-w-0 flex-1 text-3xl font-extrabold tracking-tight text-foreground sm:text-4xl break-words">
                 {activeChunk.title}
               </h1>
-              {isComplete && (
-                  <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">
-                    <Check className="h-3 w-3" strokeWidth={3} /> Read
-                  </span>
-                )}
-              <div className="mt-1.5 flex items-center gap-3 text-xs text-muted-foreground">
-                <span className="truncate">{stripExt(file.name)}</span>
-                <span>·</span>
-                <span className="inline-flex items-center gap-1">
-                  <Clock className="h-3 w-3" />≈ {stats.readingMin} min
-                </span>
+              
+              <div className="mt-1.5 flex shrink-0 items-center gap-2">
+                <button
+                  onClick={onToggleBookmark}
+                  aria-label={isBookmarked ? "Remove bookmark" : "Bookmark this chapter"}
+                  title={isBookmarked ? "Remove bookmark" : "Bookmark this chapter"}
+                  className={`inline-flex items-center justify-center rounded-md border border-border bg-background p-2 transition-colors hover:border-primary/40 active:scale-95 ${
+                    isBookmarked ? "text-primary" : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  <Bookmark
+                    className={`h-3.5 w-3.5 ${isBookmarked ? "fill-primary" : ""}`}
+                  />
+                </button>
+                <button
+                  onClick={() => setEditMode((e) => !e)}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground active:scale-95"
+                >
+                  {editMode ? (
+                    <>
+                      <Eye className="h-3.5 w-3.5" /> Preview
+                    </>
+                  ) : (
+                    <>
+                      <Pencil className="h-3.5 w-3.5" /> Edit
+                    </>
+                  )}
+                </button>
               </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={onToggleBookmark}
-                aria-label={isBookmarked ? "Remove bookmark" : "Bookmark this chapter"}
-                title={isBookmarked ? "Remove bookmark" : "Bookmark this chapter"}
-                className={`inline-flex items-center justify-center rounded-md border border-border bg-background p-2 transition-colors hover:border-primary/40 active:scale-95 ${
-                  isBookmarked ? "text-primary" : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                <Bookmark
-                  className={`h-3.5 w-3.5 ${isBookmarked ? "fill-primary" : ""}`}
-                />
-              </button>
-              <button
-                onClick={() => setEditMode((e) => !e)}
-                className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground active:scale-95"
-              >
-                {editMode ? (
-                  <>
-                    <Eye className="h-3.5 w-3.5" /> Preview
-                  </>
-                ) : (
-                  <>
-                    <Pencil className="h-3.5 w-3.5" /> Edit
-                  </>
-                )}
-              </button>
             </div>
           </div>
 
@@ -414,17 +573,19 @@ export function MarkdownViewer({
               </div>
             </div>
           ) : (
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm, remarkMath]}
-              rehypePlugins={[
-                rehypeSlug,
-                rehypeKatex,
-                [rehypeHighlight, { detect: true, ignoreMissing: true }],
-              ]}
-              components={components}
-            >
-              {activeChunk.content}
-            </ReactMarkdown>
+            <div ref={contentRef} onClick={onContentClick}>
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm, remarkMath]}
+                rehypePlugins={[
+                  rehypeSlug,
+                  rehypeKatex,
+                  [rehypeHighlight, { detect: true, ignoreMissing: true }],
+                ]}
+                components={components}
+              >
+                {renderContent}
+              </ReactMarkdown>
+            </div>
           )}
 
           {/* Natural stopping point — quiet acknowledgement, clear next step */}

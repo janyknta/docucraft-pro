@@ -126,15 +126,12 @@ export function HomePage({
 
   return (
     <div className="mx-auto w-full max-w-4xl px-6 py-10 md:px-10 md:py-16">
-      <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-        Home
-      </div>
       <h1 className="mt-2 text-3xl font-bold tracking-tight text-foreground md:text-4xl">
         {greeting}
       </h1>
       <p className="mt-2 text-sm text-muted-foreground">
         {hasFiles
-          ? "Your documents are saved on this device and restored automatically."
+          ? "Your documents are saved locally on this device and restored automatically."
           : "Upload Markdown files to start a calm, book-like reading experience."}
       </p>
 
