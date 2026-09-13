@@ -1,0 +1,20 @@
+/*
+ * Make a board sit on the app's own paper.
+ *
+ * Excalidraw paints its canvas from `viewBackgroundColor`, which lives in the
+ * scene's own appState and is saved into the `.excalidraw` file. Writing the
+ * app's theme colour there would bake a theme into the document and travel with
+ * it to excalidraw.com, so the file keeps its own background and the *frame*
+ * around it is what adapts: the container and its UI islands inherit the app
+ * surface, which is what removes the "pasted-in iframe" seam.
+ */
+.excalidraw-surface,
+.excalidraw-surface .excalidraw {
+  background: var(--background);
+}
+
+/* The canvas keeps the scene's own background — only the surround follows the
+   app theme, so a board exported from here looks the same everywhere. */
+.excalidraw-surface .excalidraw .excalidraw__canvas {
+  background: transparent;
+}

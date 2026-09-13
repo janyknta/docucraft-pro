@@ -1059,10 +1059,14 @@ export function DocsApp() {
    * it; from there the normal autosave path takes over.
    */
   const createFile = useCallback(
-    (folderId?: string | null, documentKind: "markdown" | "mermaid" = "markdown") => {
+    (folderId?: string | null, documentKind: "markdown" | "mermaid" | "board" = "markdown") => {
       const taken = new Set(snapshotRef.current.files.map((f) => f.name));
       const isMermaid = documentKind === "mermaid";
-      const name = uniqueFileName(isMermaid ? "animation.mmd" : "new.md", taken);
+      const isBoard = documentKind === "board";
+      const name = uniqueFileName(
+        isBoard ? "board.excalidraw" : isMermaid ? "animation.mmd" : "new.md",
+        taken,
+      );
       const id = `${name}-${crypto.randomUUID().slice(0, 8)}`;
       const content = isMermaid
         ? `---
@@ -1082,7 +1086,11 @@ flowchart LR
         id,
         name,
         content,
-        mimeType: isMermaid ? "text/vnd.mermaid" : "text/markdown",
+        mimeType: isBoard
+          ? "application/vnd.excalidraw+json"
+          : isMermaid
+            ? "text/vnd.mermaid"
+            : "text/markdown",
         size: content.length,
         addedAt: Date.now(),
         kind: documentKind,
@@ -1104,14 +1112,18 @@ flowchart LR
       setFiles((prev) => [...prev, doc]);
       setActiveFileId(id);
       setActiveHeadingId(null);
-      setAutoEditFileId(id);
+      // A board opens straight onto its canvas — the canvas *is* its editor, so
+      // there is no separate edit mode to request.
+      if (!isBoard) setAutoEditFileId(id);
       setDrawerOpen(false);
       if (location.pathname !== "/") navigate({ to: "/" });
       markDirty();
       toast.success(`Created ${name}`, {
-        description: isMermaid
-          ? "Edit the flow script and Mermaid source, then preview the animation."
-          : "Paste your markdown, then Save.",
+        description: isBoard
+          ? "Draw, drop in images, and sketch diagrams. Changes save automatically."
+          : isMermaid
+            ? "Edit the flow script and Mermaid source, then preview the animation."
+            : "Paste your markdown, then Save.",
       });
     },
     [location.pathname, navigate, markDirty],
@@ -1119,6 +1131,11 @@ flowchart LR
 
   const createMermaidFile = useCallback(
     (folderId?: string | null) => createFile(folderId, "mermaid"),
+    [createFile],
+  );
+
+  const createBoardFile = useCallback(
+    (folderId?: string | null) => createFile(folderId, "board"),
     [createFile],
   );
 
@@ -2232,7 +2249,7 @@ flowchart LR
           <div>
             <h1 className="text-2xl font-bold text-foreground">Drop files to view and edit</h1>
             <p className="mt-2 text-sm text-muted-foreground">
-              We support Markdown, PDFs, Spreadsheets, Presentations, Images, and more!
+              We support Markdown, Boards, PDFs, Spreadsheets, Presentations, Images, and more!
             </p>
           </div>
           <div className="flex flex-wrap items-center justify-center gap-3">
@@ -2244,13 +2261,23 @@ flowchart LR
               Upload any file
             </button>
             {/* Nothing to right-click yet, so the sidebar's New menu is out of
-                reach — a blank document has to be startable from here too. */}
+                reach — a blank document has to be startable from here too. The
+                same applies to a board: without this the only way to reach one
+                is to first create some other file just to make the sidebar
+                appear. */}
             <button
               type="button"
               onClick={() => createFile(null)}
               className="rounded-xl border border-border bg-card px-5 py-2.5 text-sm font-semibold text-foreground transition-colors hover:bg-accent"
             >
               New markdown file
+            </button>
+            <button
+              type="button"
+              onClick={() => createBoardFile(null)}
+              className="rounded-xl border border-border bg-card px-5 py-2.5 text-sm font-semibold text-foreground transition-colors hover:bg-accent"
+            >
+              New board
             </button>
           </div>
         </div>
@@ -2325,6 +2352,7 @@ flowchart LR
                 folders={folders}
                 onCreateFile={createFile}
                 onCreateMermaid={createMermaidFile}
+                onCreateBoard={createBoardFile}
                 onCreateFolder={createFolder}
                 onRenameFolder={renameFolder}
                 onDeleteFolder={deleteFolder}
@@ -2397,6 +2425,7 @@ flowchart LR
                 align="left"
                 onCreateFile={() => createFile(null)}
                 onCreateMermaid={() => createMermaidFile(null)}
+                onCreateBoard={() => createBoardFile(null)}
                 onCreateFolder={promptNewFolderFromRail}
                 onUpload={() => inputRef.current?.click()}
                 buttonClassName="rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-foreground"
@@ -2459,6 +2488,7 @@ flowchart LR
                     folders={folders}
                     onCreateFile={createFile}
                     onCreateMermaid={createMermaidFile}
+                    onCreateBoard={createBoardFile}
                     onCreateFolder={createFolder}
                     onRenameFolder={renameFolder}
                     onDeleteFolder={deleteFolder}
