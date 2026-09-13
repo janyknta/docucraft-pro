@@ -6,6 +6,7 @@ const kindByExtension: Record<string, DocumentKind> = {
   mdx: "markdown",
   mmd: "mermaid",
   mermaid: "mermaid",
+  excalidraw: "board",
   txt: "text",
   docx: "docx",
   pdf: "pdf",
@@ -60,7 +61,16 @@ export function getDocumentKind(name: string, mimeType = ""): DocumentKind {
 }
 
 export function isTextKind(kind: DocumentKind) {
-  return ["markdown", "mermaid", "text", "csv", "json", "google-doc", "google-slide", "html"].includes(kind);
+  return [
+    "markdown",
+    "mermaid",
+    "text",
+    "csv",
+    "json",
+    "google-doc",
+    "google-slide",
+    "html",
+  ].includes(kind);
 }
 
 function dataUrl(file: File): Promise<string> {
@@ -72,14 +82,30 @@ function dataUrl(file: File): Promise<string> {
   });
 }
 
+/**
+ * Kinds whose bytes are stored as text in `content` rather than as a data URL
+ * in `data`.
+ *
+ * An `.excalidraw` board is JSON, so it is stored as text — but it is not
+ * an `isTextKind`, because that flag also decides who may edit a document, and
+ * a board's editor is its canvas, never the markdown editor.
+ *
+ * Both the read and the data-URL branch below must agree on this, or a board
+ * gets stored twice: once as text and again as base64. That matters here, where
+ * the workspace enforces a hard storage cap against each file's `size`.
+ */
+function isTextSourced(kind: DocumentKind) {
+  return isTextKind(kind) || kind === "board";
+}
+
 export async function importDocumentFile(file: File): Promise<MdFile> {
   let kind = getDocumentKind(file.name, file.type);
-  const content = isTextKind(kind) ? await file.text() : "";
+  const content = isTextSourced(kind) ? await file.text() : "";
   const linkedGoogleFile = googleUrl(content);
   if (linkedGoogleFile && kind === "text") {
     kind = linkedGoogleFile.includes("/presentation/") ? "google-slide" : "google-doc";
   }
-  const data = isTextKind(kind) ? undefined : await dataUrl(file);
+  const data = isTextSourced(kind) ? undefined : await dataUrl(file);
   const id = `${file.name}-${crypto.randomUUID().slice(0, 8)}`;
   return {
     id,
@@ -135,6 +161,7 @@ export function fileLabel(kind: DocumentKind) {
     {
       markdown: "Markdown",
       mermaid: "Mermaid",
+      board: "Board",
       text: "Text",
       docx: "Word",
       pdf: "PDF",

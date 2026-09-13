@@ -43,6 +43,7 @@ import {
   Code,
   Quote,
   List,
+  PenTool,
   Star,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -60,6 +61,7 @@ import { useNavHistory } from "@/hooks/use-nav-history";
 const KIND_ICON: Partial<Record<DocumentKind, LucideIcon>> = {
   markdown: FileText,
   mermaid: Workflow,
+  board: PenTool,
   text: FileText,
   docx: FileType,
   pdf: FileType,
@@ -172,6 +174,7 @@ interface Props {
   onCreateFile?: (folderId?: string | null) => void;
   /** Create an animated standalone Mermaid source file. */
   onCreateMermaid?: (folderId?: string | null) => void;
+  onCreateBoard?: (folderId?: string | null) => void;
   onCreateFolder?: (name: string) => void;
   onRenameFolder?: (id: string, name: string) => void;
   /** Deleting a folder keeps its documents — they return to the top level. */
@@ -195,7 +198,8 @@ interface Props {
   onSortByName?: () => void;
   view?: SidebarView;
   onView?: (view: SidebarView) => void;
-  onOpenSettings: () => void;
+  /** Opens settings. An optional tab id lands the dialog on that section. */
+  onOpenSettings: (tab?: "workspace") => void;
   /** Open the Ask AI panel. When omitted, the Ask AI button is hidden. */
   onAskAi?: () => void;
   onNewWorkspace?: (name?: string) => void;
@@ -239,6 +243,7 @@ function SidebarImpl({
   folders = [],
   onCreateFile,
   onCreateMermaid,
+  onCreateBoard,
   onCreateFolder,
   onRenameFolder,
   onDeleteFolder,
@@ -495,7 +500,7 @@ function SidebarImpl({
     const KindIcon = kindIcon(kind);
     const mins = readingMinutes(file.content);
     const title = file.name.replace(
-      /\.(md|markdown|mdx|mmd|mermaid|txt|docx|pdf|xlsx|xls|csv|json|ppt|pptx|gdoc|gslides)$/i,
+      /\.(md|markdown|mdx|mmd|mermaid|excalidraw|txt|docx|pdf|xlsx|xls|csv|json|html|htm|ppt|pptx|gdoc|gslides)$/i,
       "",
     );
     const dragActive = reordering && !viewActive && realIndex >= 0 && !selecting;
@@ -607,10 +612,7 @@ function SidebarImpl({
               // rather than present and inert.
               onEdit={
                 onEditFile &&
-                (kind === "markdown" ||
-                  kind === "mermaid" ||
-                  kind === "text" ||
-                  kind === "json")
+                (kind === "markdown" || kind === "mermaid" || kind === "text" || kind === "json")
                   ? () => onEditFile(file.id)
                   : undefined
               }
@@ -794,6 +796,7 @@ function SidebarImpl({
           <AddMenu
             onCreateFile={onCreateFile ? () => onCreateFile(null) : undefined}
             onCreateMermaid={onCreateMermaid ? () => onCreateMermaid(null) : undefined}
+            onCreateBoard={onCreateBoard ? () => onCreateBoard(null) : undefined}
             onCreateFolder={onCreateFolder ? promptNewFolder : undefined}
             onUpload={onAddFiles}
           />
@@ -911,7 +914,10 @@ function SidebarImpl({
                       </button>
                       <FolderMenu
                         onNewFile={onCreateFile ? () => onCreateFile(folder.id) : undefined}
-                        onNewMermaid={onCreateMermaid ? () => onCreateMermaid(folder.id) : undefined}
+                        onNewMermaid={
+                          onCreateMermaid ? () => onCreateMermaid(folder.id) : undefined
+                        }
+                        onNewBoard={onCreateBoard ? () => onCreateBoard(folder.id) : undefined}
                         onNewFolder={onCreateFolder ? promptNewFolder : undefined}
                         onRename={
                           onRenameFolder
@@ -977,12 +983,8 @@ function SidebarImpl({
             variant="sidebar"
             workspaces={workspaces}
             currentId={currentWorkspaceId ?? null}
-            onSwitch={onSwitchWorkspace}
             onNew={(name) => onNewWorkspace?.(name)}
             onDelete={(id) => onDeleteWorkspace?.(id)}
-            onImport={(file) => onImportWorkspace?.(file)}
-            onExport={() => onExportWorkspace?.()}
-            onShare={() => onShareWorkspace?.()}
             onSettings={onOpenSettings}
           />
         )}
@@ -1531,6 +1533,7 @@ function MenuPanel({
 export function AddMenu({
   onCreateFile,
   onCreateMermaid,
+  onCreateBoard,
   onCreateFolder,
   onUpload,
   align = "right",
@@ -1539,6 +1542,7 @@ export function AddMenu({
 }: {
   onCreateFile?: () => void;
   onCreateMermaid?: () => void;
+  onCreateBoard?: () => void;
   onCreateFolder?: () => void;
   onUpload: () => void;
   align?: "left" | "right";
@@ -1599,6 +1603,16 @@ export function AddMenu({
               }}
             />
           )}
+          {onCreateBoard && (
+            <MenuItem
+              icon={PenTool}
+              label="New board"
+              onClick={() => {
+                setOpen(false);
+                onCreateBoard();
+              }}
+            />
+          )}
           {onCreateFolder && (
             <MenuItem
               icon={FolderPlus}
@@ -1627,12 +1641,14 @@ export function AddMenu({
 function FolderMenu({
   onNewFile,
   onNewMermaid,
+  onNewBoard,
   onNewFolder,
   onRename,
   onDelete,
 }: {
   onNewFile?: () => void;
   onNewMermaid?: () => void;
+  onNewBoard?: () => void;
   onNewFolder?: () => void;
   onRename?: () => void;
   onDelete?: () => void;
@@ -1686,8 +1702,9 @@ function FolderMenu({
         <MenuPanel>
           {onNewFile && item("New File here", FilePlus, onNewFile)}
           {onNewMermaid && item("New Mermaid here", Workflow, onNewMermaid)}
+          {onNewBoard && item("New Board here", PenTool, onNewBoard)}
           {onNewFolder && item("New Folder", FolderPlus, onNewFolder)}
-          {(onNewFile || onNewMermaid || onNewFolder) && (onRename || onDelete) && (
+          {(onNewFile || onNewMermaid || onNewBoard || onNewFolder) && (onRename || onDelete) && (
             <div className="my-1 h-px bg-border" />
           )}
           {onRename && item("Rename folder", Pencil, onRename)}

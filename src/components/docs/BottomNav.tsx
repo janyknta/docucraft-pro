@@ -6,7 +6,6 @@ import { useState, useRef, useEffect } from "react";
 export function BottomNav({
   workspaces,
   currentWorkspaceId,
-  onSwitchWorkspace,
   onNewWorkspace,
   bookmarks,
   onSelectBookmark,
@@ -113,23 +112,25 @@ export function BottomNav({
             <SheetTitle>Workspaces</SheetTitle>
           </SheetHeader>
           <div className="mt-4 flex flex-col gap-2">
-            {workspaces.map((ws: any) => (
-              <button
-                key={ws.id}
-                onClick={() => {
-                  onSwitchWorkspace(ws.id);
-                  setWsSheetOpen(false);
-                }}
-                className={`flex items-center justify-between rounded-lg p-3 text-sm font-medium transition-colors ${
-                  ws.id === currentWorkspaceId
-                    ? "bg-accent text-foreground"
-                    : "text-muted-foreground hover:bg-accent hover:text-foreground"
-                }`}
-              >
-                {ws.name}
-                {ws.id === currentWorkspaceId && <CheckCircle2 className="h-4 w-4 text-primary" />}
-              </button>
-            ))}
+            {/* The workspace you are in, then one row into workspace settings
+                for the rest. Listing them all here grew the sheet without
+                bound on the smallest screens. */}
+            {currentWorkspace && (
+              <div className="flex items-center justify-between rounded-lg bg-accent p-3 text-sm font-medium text-foreground">
+                {currentWorkspace.name}
+                <CheckCircle2 className="h-4 w-4 text-primary" />
+              </div>
+            )}
+            <button
+              onClick={() => {
+                setWsSheetOpen(false);
+                onSettings("workspace");
+              }}
+              className="flex items-center gap-2 rounded-lg p-3 text-left text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            >
+              <FolderOpen className="h-4 w-4 shrink-0" />
+              All workspaces
+            </button>
 
             {/* Create inline input */}
             <div className="mt-2">

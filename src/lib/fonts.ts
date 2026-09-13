@@ -45,29 +45,10 @@ export function loadMonoFont(): void {
   );
 }
 
-/** The reader's chosen body/heading face. "system" and "sans" need no download. */
+/** The reader's chosen body/heading face. "custom" is an uploaded file, served
+ *  from IndexedDB and registered by custom-font.ts — nothing to fetch here. */
 export function loadReadingFont(font: ReadingFont): void {
   switch (font) {
-    case "serif":
-      once("source-serif-4", () =>
-        Promise.all([
-          import("@fontsource/source-serif-4/400.css"),
-          import("@fontsource/source-serif-4/400-italic.css"),
-          import("@fontsource/source-serif-4/600.css"),
-          import("@fontsource/source-serif-4/700.css"),
-        ]),
-      );
-      break;
-    case "newsreader":
-      once("newsreader", () =>
-        Promise.all([
-          import("@fontsource/newsreader/400.css"),
-          import("@fontsource/newsreader/400-italic.css"),
-          import("@fontsource/newsreader/600.css"),
-          import("@fontsource/newsreader/700.css"),
-        ]),
-      );
-      break;
     case "hyperlegible":
       once("atkinson-hyperlegible", () =>
         Promise.all([
@@ -76,11 +57,7 @@ export function loadReadingFont(font: ReadingFont): void {
         ]),
       );
       break;
-    case "sans":
-      // Maps to --font-ui, which is Inter.
-      loadUiFont();
-      break;
-    case "system":
+    case "custom":
       break;
   }
 }

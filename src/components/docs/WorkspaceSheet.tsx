@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { FolderOpen, Upload, Download, Check, PlusCircle, Users } from "lucide-react";
+import { FolderOpen, Check, PlusCircle } from "lucide-react";
 import { BottomSheet } from "@/components/ui/bottom-sheet";
 
 interface WorkspaceLite {
@@ -13,9 +13,8 @@ interface Props {
   onSwitch: (id: string) => void;
   onNew: (name: string) => void;
   onDelete: (id: string) => void;
-  onImport: (file: File) => void;
-  onExport: () => void;
-  onShare: () => void;
+  /** Opens settings, optionally on a given section. */
+  onSettings?: (tab?: "workspace") => void;
 }
 
 /**
@@ -29,9 +28,7 @@ export function WorkspaceSheet({
   onSwitch,
   onNew,
   onDelete,
-  onImport,
-  onExport,
-  onShare,
+  onSettings,
 }: Props) {
   const [open, setOpen] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
@@ -92,23 +89,19 @@ export function WorkspaceSheet({
                   </div>
                 )}
 
-                {workspaces.length > 1 && (
-                  <div className="flex flex-col gap-0.5">
-                    {workspaces
-                      .filter((w) => w.id !== currentId)
-                      .map((w) => (
-                        <button
-                          key={w.id}
-                          onClick={() => {
-                            onSwitch(w.id);
-                            setOpen(false);
-                          }}
-                          className="truncate rounded-xl px-3 py-2.5 text-left text-sm font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none"
-                        >
-                          {w.name}
-                        </button>
-                      ))}
-                  </div>
+                {/* The full list lives in workspace settings. Inline it grew
+                    without bound and pushed the actions off a phone screen. */}
+                {onSettings && (
+                  <button
+                    onClick={() => {
+                      onSettings("workspace");
+                      setOpen(false);
+                    }}
+                    className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-left text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none"
+                  >
+                    <FolderOpen className="h-4 w-4 shrink-0" strokeWidth={1.5} />
+                    All workspaces
+                  </button>
                 )}
 
                 {/* Creating a workspace belongs beside the workspaces it would
@@ -160,63 +153,10 @@ export function WorkspaceSheet({
             </div>
           )}
 
-          {/* New workspace lives in the list above; this strip is for what you
-              do *to* a workspace. */}
-          <div className="flex border-t border-border bg-muted/50 mt-4 rounded-xl overflow-hidden">
-            <ActionButton
-              icon={Upload}
-              label="Import"
-              onClick={() => {
-                const input = document.createElement("input");
-                input.type = "file";
-                input.accept = "application/json,.json";
-                input.onchange = (e) => {
-                  const f = (e.target as HTMLInputElement).files?.[0];
-                  if (f) onImport(f);
-                  setOpen(false);
-                };
-                input.click();
-              }}
-            />
-            <ActionButton
-              icon={Download}
-              label="Export"
-              onClick={() => {
-                onExport();
-                setOpen(false);
-              }}
-            />
-            <ActionButton
-              icon={Users}
-              label="Share"
-              onClick={() => {
-                onShare();
-                setOpen(false);
-              }}
-            />
-          </div>
+          {/* Import, export and share live in workspace settings now — rare
+              actions that do not need a permanent strip on a phone screen. */}
         </div>
       </BottomSheet>
     </>
-  );
-}
-
-function ActionButton({
-  icon: Icon,
-  label,
-  onClick,
-}: {
-  icon: any;
-  label: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className="flex flex-1 flex-col items-center justify-center gap-1.5 py-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-    >
-      <Icon className="h-4 w-4" strokeWidth={1.5} />
-      {label}
-    </button>
   );
 }

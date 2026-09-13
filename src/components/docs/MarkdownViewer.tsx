@@ -43,6 +43,7 @@ import type { MdFile } from "@/lib/markdown-utils";
 import type { ReadingMode } from "@/lib/persistence";
 import { slugify } from "@/lib/markdown-utils";
 import { MermaidBlock } from "./MermaidLazy";
+import { SaveActionContext } from "./save-action";
 import { MindMapBlock } from "./MindMapBlock";
 import { ReadingProgress } from "./ReadingProgress";
 import { MarkdownEditor, type MarkdownEditorHandle } from "./MarkdownEditor";
@@ -517,8 +518,7 @@ function MarkdownViewerImpl({
       // Flash: a text range gets a one-shot CSS highlight, a heading or image
       // (which have no range) get the equivalent class-based pulse.
       const CSSH = (typeof CSS !== "undefined" && (CSS as any).highlights) as
-        | Map<string, any>
-        | undefined;
+        Map<string, any> | undefined;
       let clear: (() => void) | undefined;
       if (range && CSSH && typeof (window as any).Highlight !== "undefined") {
         CSSH.set("dc-saved-flash", new (window as any).Highlight(range));
@@ -600,8 +600,7 @@ function MarkdownViewerImpl({
   useEffect(() => {
     const container = contentRef.current;
     const CSSH = (typeof CSS !== "undefined" && (CSS as any).highlights) as
-      | Map<string, any>
-      | undefined;
+      Map<string, any> | undefined;
     if (!container || !CSSH || typeof (window as any).Highlight === "undefined") return;
     // Mid-edit the rendered document is a moving target (the draft autosaves
     // every 400ms). Re-anchoring waits for the reader to leave the editor.
@@ -929,6 +928,12 @@ function MarkdownViewerImpl({
           <SavableBlock
             blockType="code"
             className={isMermaid ? "docs-savable-mermaid" : "docs-savable-code"}
+            // A diagram puts the save action in its own control tray, so the
+            // star is not drawn floating beside it. Its rendered text is the
+            // stylesheet Mermaid injects rather than anything the reader sees,
+            // so the source is what identifies it.
+            renderOwnSaveAction={isMermaid}
+            identity={isMermaid ? extractText(codeEl?.props?.children).trim() : undefined}
           >
             <CodeBlock {...p} />
           </SavableBlock>
@@ -967,11 +972,43 @@ function MarkdownViewerImpl({
           </SavableBlock>
         );
       },
-      a: (p: any) => (
-        <a {...p} target={p.href?.startsWith("http") ? "_blank" : undefined} rel="noreferrer">
-          {walkChildren(p.children)}
-        </a>
-      ),
+      a: (p: any) => {
+        const href = typeof p.href === "string" ? p.href : "";
+        // An in-page reference (`[see](#recommended-controls)`) used to be left
+        // to the browser, which looks for the element and finds nothing: in
+        // paginated mode the target heading usually lives in a *different*
+        // chunk that isn't mounted, so the click did nothing at all. Resolve it
+        // through the app's own navigation instead — switch to the chunk that
+        // owns the heading, then scroll to it.
+        if (href.startsWith("#")) {
+          const targetId = decodeURIComponent(href.slice(1));
+          return (
+            <a
+              {...p}
+              onClick={(event: React.MouseEvent) => {
+                if (event.metaKey || event.ctrlKey || event.shiftKey) return;
+                event.preventDefault();
+                const owner = chunkForHeading[targetId] ?? targetId;
+                // Selecting the chunk mounts it; the effect that watches
+                // `activeSubtopicId` scrolls to the heading once it exists.
+                onNav(file.id, owner === targetId ? targetId : targetId);
+                requestAnimationFrame(() => {
+                  document
+                    .getElementById(targetId)
+                    ?.scrollIntoView({ behavior: "smooth", block: "start" });
+                });
+              }}
+            >
+              {walkChildren(p.children)}
+            </a>
+          );
+        }
+        return (
+          <a {...p} target={href.startsWith("http") ? "_blank" : undefined} rel="noreferrer">
+            {walkChildren(p.children)}
+          </a>
+        );
+      },
       li: (p: any) => <li {...p}>{walkChildren(p.children)}</li>,
       table: (p: any) => (
         <SavableBlock blockType="table" className="docs-savable-table">
@@ -1211,6 +1248,34 @@ function MarkdownViewerImpl({
               </button>
 
               <div className="flex items-center gap-1">
+                {/* Saving lives here rather than on a star pinned to every
+                    block: the reader has already told us what they care about
+                    by selecting it, and a selection can be any range — a
+                    paragraph, part of a table, a whole section — where a block
+                    star could only ever offer the block it sat on. */}
+                {savedCtx.enabled && menu.mode === "create" && (
+                  <button
+                    onClick={() => {
+                      savedCtx.toggle({
+                        kind: "block",
+                        blockType: "text",
+                        title: savedExcerpt(menu.text, 90),
+                        text: menu.text,
+                        subtopicId: savedCtx.subtopicId,
+                        start: menu.start,
+                        end: menu.end,
+                        prefix: menu.prefix,
+                        suffix: menu.suffix,
+                      });
+                      window.getSelection()?.removeAllRanges();
+                      setMenu(null);
+                    }}
+                    title="Save this selection"
+                    className="flex flex-1 items-center justify-center gap-1.5 rounded-md border border-border px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+                  >
+                    <Star className="h-3.5 w-3.5" /> Save
+                  </button>
+                )}
                 <button
                   onClick={() => {
                     navigator.clipboard.writeText(
@@ -1220,7 +1285,7 @@ function MarkdownViewerImpl({
                   }}
                   className="flex flex-1 items-center justify-center gap-1.5 rounded-md border border-border px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
                 >
-                  <Copy className="h-3.5 w-3.5" /> Copy
+                  <Copy className="h-3.5 w-3.5" />
                 </button>
                 {menu.mode === "edit" && (
                   <button
@@ -1359,12 +1424,17 @@ export const MarkdownViewer = memo(MarkdownViewerImpl);
  * Wraps a block (table, code fence, quote, image) with a hover star that saves
  * it. The block's own rendered text is the quote the saved item re-anchors by,
  * so a saved table is still findable after the document around it is edited.
+ *
+ * A block that already owns a row of overlay controls — a diagram — can render
+ * the save action itself instead, as one more segment in that row. It reads the
+ * action from {@link SaveActionContext}; see `renderOwnSaveAction`.
  */
 function SavableBlock({
   blockType,
   as: Wrapper = "div",
   className = "",
   identity,
+  renderOwnSaveAction,
   children,
 }: {
   blockType: SavedBlockType;
@@ -1372,6 +1442,11 @@ function SavableBlock({
   className?: string;
   /** Stands in for the text of blocks that have none — an image's src. */
   identity?: string;
+  /**
+   * Suppress the floating star and publish the save action on context instead,
+   * for a block that places it among its own controls.
+   */
+  renderOwnSaveAction?: boolean;
   children: React.ReactNode;
 }) {
   const ctx = useContext(SavedContext);
@@ -1391,12 +1466,19 @@ function SavableBlock({
 
   if (!ctx?.enabled) return <>{children}</>;
 
-  const probe = text || identity || "";
+  // `identity` wins over the rendered text where it is given. A block whose DOM
+  // text is not its content — a diagram, whose textContent is the stylesheet
+  // Mermaid injects, complete with a per-render generated id — would otherwise
+  // be saved under a key that changes on every render and never matches itself
+  // again, so the star could never show as saved and never toggle back off.
+  const probe = identity || text || "";
   const existing = ctx.isSaved({ kind: "block", text: probe });
 
-  const toggle = (e: React.MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
+  const toggle = (e?: React.MouseEvent) => {
+    // Invoked from a menu item as well as a button, and a menu item has no
+    // event to give — the guards are what let one handler serve both.
+    e?.preventDefault();
+    e?.stopPropagation();
     if (existing) {
       ctx.remove(existing.id);
       return;
@@ -1404,7 +1486,7 @@ function SavableBlock({
     const container = ctx.containerRef.current;
     const el = ref.current;
     const offsets = container && el ? nodeOffsets(container, el) : null;
-    const quote = offsets?.text.trim() || probe;
+    const quote = identity || offsets?.text.trim() || probe;
     ctx.toggle({
       kind: "block",
       blockType,
@@ -1422,19 +1504,32 @@ function SavableBlock({
     });
   };
 
+  if (renderOwnSaveAction) {
+    return (
+      <Wrapper ref={ref} className={`docs-savable ${className}`.trim()}>
+        <SaveActionContext.Provider
+          value={{
+            saved: Boolean(existing),
+            toggle,
+            label: existing ? `Remove saved ${blockType}` : `Save ${blockType}`,
+            title: existing ? "Saved — click to remove" : `Save this ${blockType}`,
+          }}
+        >
+          {children}
+        </SaveActionContext.Provider>
+      </Wrapper>
+    );
+  }
+
+  // No floating star. A star pinned to the corner of every table, quote, image
+  // and code fence turned the document into a field of controls competing with
+  // the prose — and it only ever offered to save whole blocks, never the
+  // paragraph or the half-table the reader actually cared about. Saving now
+  // lives on the selection popover, which can save any range at all, so the
+  // block wrapper keeps its identity and offsets and draws nothing.
   return (
     <Wrapper ref={ref} className={`docs-savable ${className}`.trim()}>
       {children}
-      <button
-        type="button"
-        onClick={toggle}
-        data-saved={existing ? "true" : "false"}
-        className="docs-save-star"
-        title={existing ? "Saved — click to remove" : `Save this ${blockType}`}
-        aria-label={existing ? `Remove saved ${blockType}` : `Save ${blockType}`}
-      >
-        <Star className={`h-3.5 w-3.5 ${existing ? "fill-gold text-gold" : ""}`} />
-      </button>
     </Wrapper>
   );
 }
@@ -1452,32 +1547,18 @@ function HeadingLink({ as: Tag, children, id, highlight, ...rest }: any) {
   return (
     <Tag id={finalId} {...rest} className="group scroll-mt-24">
       {typeof children === "string" ? (highlight?.(children) ?? children) : children}
-      {ctx?.enabled && (
+      {/* A saved section still marks its heading, but only once it *is* saved:
+          an always-present star on every heading was chrome the reader had to
+          look past on the way down the page. Saving a section is done from the
+          selection popover now; this is the receipt, not the button. */}
+      {ctx?.enabled && savedSection && (
         <button
-          onClick={() => {
-            if (savedSection) {
-              ctx.remove(savedSection.id);
-              return;
-            }
-            ctx.toggle({
-              kind: "section",
-              title: text || finalId,
-              headingId: finalId,
-              subtopicId: ctx.subtopicId,
-              text: text || undefined,
-            });
-          }}
-          /* The icon stays 16px, but the button carries a 36px hit area so it
-             is reachable with a fingertip. */
-          className={`ml-1 inline-flex h-9 w-9 items-center justify-center align-middle transition-opacity group-hover:opacity-100 ${
-            savedSection ? "opacity-100" : "opacity-0 [@media(hover:none)]:opacity-100"
-          }`}
-          title={savedSection ? "Saved — click to remove" : "Save this section"}
-          aria-label={savedSection ? "Remove saved section" : "Save section"}
+          onClick={() => ctx.remove(savedSection.id)}
+          className="ml-1 inline-flex h-9 w-9 items-center justify-center align-middle"
+          title="Saved — click to remove"
+          aria-label="Remove saved section"
         >
-          <Star
-            className={`h-4 w-4 ${savedSection ? "fill-gold text-gold" : "text-muted-foreground"}`}
-          />
+          <Star className="h-4 w-4 fill-gold text-gold" />
         </button>
       )}
       <button
