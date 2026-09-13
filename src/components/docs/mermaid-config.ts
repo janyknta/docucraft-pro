@@ -5,11 +5,21 @@ export const LARGE_DIAGRAM_MAX_TEXT_SIZE = 10_000_000;
 export const LARGE_DIAGRAM_MAX_EDGES = 20_000;
 
 /** Return a fresh object because Mermaid may normalize its configuration. */
-export function largeDiagramMermaidConfig() {
+export function largeDiagramMermaidConfig(performanceMode = false) {
   return {
     securityLevel: "loose",
     fontFamily: "ui-sans-serif, system-ui, sans-serif",
     maxTextSize: LARGE_DIAGRAM_MAX_TEXT_SIZE,
     maxEdges: LARGE_DIAGRAM_MAX_EDGES,
+    ...(performanceMode
+      ? {
+          // HTML labels create a foreignObject and nested HTML subtree for
+          // every label. Plain SVG text is substantially cheaper at ERD scale.
+          htmlLabels: false,
+          markdownAutoWrap: false,
+          // Do not build Mermaid's additional error SVG for huge failed input.
+          suppressErrorRendering: true,
+        }
+      : {}),
   } as const;
 }

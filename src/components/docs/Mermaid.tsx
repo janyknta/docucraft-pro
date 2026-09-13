@@ -1,12 +1,16 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Download, Expand, LoaderCircle, Minus, Plus, Star, X } from "lucide-react";
 import { toast } from "sonner";
-import { MermaidAnimator, type MermaidAnimator as MermaidAnimatorInstance } from "mermaid-animator";
+import type { MermaidAnimator as MermaidAnimatorInstance } from "mermaid-animator";
 import { useSaveAction } from "./save-action";
-import { applySemantics } from "@/lib/explainer/semantics";
 import { clearRenderArtifacts, describeRenderError } from "./render-error";
 import { largeDiagramMermaidConfig } from "./mermaid-config";
+import {
+  optimizeSvgForImageRendering,
+  readSvgViewBox,
+  shouldUseDiagramPerformanceMode,
+} from "./mermaid-performance";
 import {
   MAX_STAGE_RATIO,
   MIN_STAGE_RATIO,
@@ -191,7 +195,14 @@ export function Mermaid({
   const [stageRatio, setStageRatio] = useState<number | null>(null);
   // Present when the markdown viewer has delegated its save star to this tray.
   const saveAction = useSaveAction();
-  const source = code.trim();
+  // Trimming a multi-megabyte source on every state update is measurable. The
+  // prop changes only when the document changes, so retain the normalized view.
+  const source = useMemo(() => code.trim(), [code]);
+  const performanceMode = useMemo(() => shouldUseDiagramPerformanceMode(source), [source]);
+  const [performanceImageUrl, setPerformanceImageUrl] = useState<string | null>(null);
+  const handlePerformanceImage = useCallback((url: string | null) => {
+    setPerformanceImageUrl(url);
+  }, []);
   const frameCap = stageRatio ? (widthCap(stageRatio) ?? null) : null;
 
   /**
@@ -295,15 +306,22 @@ export function Mermaid({
     </TrayButton>
   ) : null;
 
-  const unavailable = steppedUnavailable
-    ? { stepped: "This diagram has no sequence to step through" }
-    : undefined;
+  const unavailable: Partial<Record<MermaidMode, string>> | undefined = performanceMode
+    ? {
+        stepped: "Disabled for very large diagrams to keep rendering responsive",
+        flow: "Disabled for very large diagrams to protect device performance",
+      }
+    : steppedUnavailable
+      ? { stepped: "This diagram has no sequence to step through" }
+      : undefined;
 
-  const modeControl = <ModeTabs mode={mode} onChange={setMode} unavailable={unavailable} />;
+  const visibleMode = performanceMode ? "raw" : mode;
+  const modeControl = <ModeTabs mode={visibleMode} onChange={setMode} unavailable={unavailable} />;
 
   // An unsupported diagram still has to show something: render it raw while
   // leaving the reader's chosen tab alone.
-  const effectiveMode: MermaidMode = mode === "stepped" && steppedUnavailable ? "raw" : mode;
+  const effectiveMode: MermaidMode =
+    performanceMode || (mode === "stepped" && steppedUnavailable) ? "raw" : mode;
 
   /**
    * The bar above the diagram: what mode you are in, and what you can do to the
@@ -361,11 +379,13 @@ export function Mermaid({
         <StaticStage
           code={source}
           dark={dark}
-          colored={colored}
+          colored={colored && !performanceMode}
           fill={stageFill}
           controls={controls}
           onError={setRenderError}
           onRatio={stageFill ? undefined : setStageRatio}
+          performanceMode={performanceMode}
+          onPerformanceImage={handlePerformanceImage}
         />
       );
     }
@@ -391,6 +411,7 @@ export function Mermaid({
       <div
         className="mermaid-frame my-6 overflow-hidden rounded-xl border border-border bg-muted/30 mx-auto"
         style={frameCap ? { maxWidth: frameCap } : undefined}
+        data-performance-mode={performanceMode ? "" : undefined}
       >
         {header}
         {renderError ? <MermaidError error={renderError} /> : stageFor(false)}
@@ -413,7 +434,9 @@ export function Mermaid({
               <header className="flex h-14 shrink-0 items-center justify-between gap-3 border-b border-border px-4 sm:px-6">
                 <div>
                   <h1 className="text-sm font-semibold text-foreground">{baseName(name)}</h1>
-                  <p className="text-[11px] text-muted-foreground">{MODE_HINT[mode]}</p>
+                  <p className="text-[11px] text-muted-foreground">
+                    {performanceMode ? "Large-diagram performance mode" : MODE_HINT[mode]}
+                  </p>
                 </div>
                 <div className="flex items-center gap-2">
                   {modeControl}
@@ -428,7 +451,17 @@ export function Mermaid({
                   </Tray>
                 </div>
               </header>
-              <div className="min-h-0 flex-1">{stageFor(true)}</div>
+              <div className="min-h-0 flex-1">
+                {performanceMode ? (
+                  performanceImageUrl ? (
+                    <PerformanceDiagramImage src={performanceImageUrl} name={baseName(name)} fill />
+                  ) : (
+                    <StageSpinner label="Preparing large diagram…" />
+                  )
+                ) : (
+                  stageFor(true)
+                )}
+              </div>
             </div>
           </div>,
           document.body,
@@ -514,6 +547,8 @@ function AnimatorStage({
         mermaid: largeDiagramMermaidConfig(),
       } as const;
       try {
+        const { MermaidAnimator } = await import("mermaid-animator");
+        if (disposed || generation !== renderGenerationRef.current) return;
         let animator: MermaidAnimatorInstance;
         try {
           animator = await MermaidAnimator.create(container, code, options);
@@ -661,6 +696,8 @@ function StaticStage({
   controls,
   onError,
   onRatio,
+  performanceMode,
+  onPerformanceImage,
 }: {
   code: string;
   dark: boolean;
@@ -670,16 +707,26 @@ function StaticStage({
   controls?: React.ReactNode;
   onError: (message: string | null) => void;
   onRatio?: (ratio: number) => void;
+  performanceMode?: boolean;
+  onPerformanceImage?: (url: string | null) => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(true);
   const [ratio, setRatio] = useState<number | null>(null);
   const [size, setSize] = useState<DiagramSize | null>(null);
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const imageUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
     const host = hostRef.current;
-    if (!host) return;
+    if (!performanceMode && !host) return;
     let disposed = false;
+    if (imageUrlRef.current) {
+      URL.revokeObjectURL(imageUrlRef.current);
+      imageUrlRef.current = null;
+      setImageUrl(null);
+      onPerformanceImage?.(null);
+    }
     setLoading(true);
     onError(null);
     // Declared out here so the failure path can clean up after the same id.
@@ -690,17 +737,43 @@ function StaticStage({
         mermaid.initialize({
           startOnLoad: false,
           theme: dark ? "dark" : "default",
-          ...largeDiagramMermaidConfig(),
+          ...largeDiagramMermaidConfig(performanceMode),
         });
         const { svg } = await mermaid.render(id, code);
         if (disposed) return;
-        host.innerHTML = svg;
-        const svgEl = host.querySelector("svg");
+        if (performanceMode) {
+          const view = readSvgViewBox(svg);
+          if (view) {
+            const measured = clampStageRatio(view.height / view.width);
+            setRatio(measured);
+            setSize(view);
+            onRatio?.(measured);
+          }
+          const url = URL.createObjectURL(
+            new Blob([optimizeSvgForImageRendering(svg)], { type: "image/svg+xml" }),
+          );
+          if (disposed) {
+            URL.revokeObjectURL(url);
+            return;
+          }
+          imageUrlRef.current = url;
+          setImageUrl(url);
+          onPerformanceImage?.(url);
+          setLoading(false);
+          return;
+        }
+
+        host!.innerHTML = svg;
+        const svgEl = host!.querySelector("svg");
         if (svgEl) {
           // Mermaid pins max-width to the intrinsic width, which stops the
           // diagram growing to fill the stage the way the animated modes do.
           svgEl.setAttribute("preserveAspectRatio", "xMidYMid meet");
-          if (colored) applySemantics(svgEl as SVGSVGElement);
+          if (colored) {
+            const { applySemantics } = await import("@/lib/explainer/semantics");
+            if (disposed) return;
+            applySemantics(svgEl as SVGSVGElement);
+          }
           svgEl.style.maxWidth = "100%";
           svgEl.style.width = "100%";
           svgEl.style.height = "100%";
@@ -726,9 +799,24 @@ function StaticStage({
     void run();
     return () => {
       disposed = true;
-      host.innerHTML = "";
+      if (imageUrlRef.current) URL.revokeObjectURL(imageUrlRef.current);
+      imageUrlRef.current = null;
+      onPerformanceImage?.(null);
+      if (host) host.innerHTML = "";
     };
-  }, [code, dark, colored, onError, onRatio]);
+  }, [code, dark, colored, onError, onPerformanceImage, onRatio, performanceMode]);
+
+  if (performanceMode) {
+    return (
+      <div className="relative min-h-64 w-full">
+        {loading || !imageUrl ? (
+          <StageSpinner label="Rendering large diagram…" />
+        ) : (
+          <PerformanceDiagramImage src={imageUrl} name="Large Mermaid diagram" />
+        )}
+      </div>
+    );
+  }
 
   return (
     <div
@@ -759,6 +847,57 @@ function StaticStage({
         }`}
         style={fill ? undefined : stageBoxStyle(ratio ?? 0.42, TRAY_GUTTER, size ?? undefined)}
       />
+    </div>
+  );
+}
+
+/**
+ * A large SVG stays outside the live DOM and is decoded as one image. Zooming
+ * changes only two box dimensions instead of restyling thousands of SVG nodes.
+ */
+function PerformanceDiagramImage({
+  src,
+  name,
+  fill,
+}: {
+  src: string;
+  name: string;
+  fill?: boolean;
+}) {
+  const [zoom, setZoom] = useState(1);
+  const zoomBy = (factor: number) => setZoom((value) => Math.min(32, Math.max(1, value * factor)));
+
+  return (
+    <div
+      className={`group/stage relative w-full ${fill ? "h-full" : "h-[min(32rem,70vh)] min-h-64"}`}
+    >
+      <div className="h-full w-full overflow-auto overscroll-contain">
+        <div
+          className="relative min-h-full min-w-full"
+          style={{ width: `${zoom * 100}%`, height: `${zoom * 100}%` }}
+        >
+          <img
+            src={src}
+            alt={name}
+            decoding="async"
+            draggable={false}
+            className="absolute inset-0 h-full w-full select-none object-contain"
+          />
+        </div>
+      </div>
+      <div className="absolute bottom-3 right-3 z-10 flex items-center">
+        <Tray>
+          <TrayButton onClick={() => zoomBy(0.5)} label="Zoom out">
+            <Minus className="h-3.5 w-3.5" />
+          </TrayButton>
+          <TrayButton onClick={() => setZoom(1)} label="Fit diagram">
+            <span className="text-[10px] font-semibold">{Math.round(zoom * 100)}%</span>
+          </TrayButton>
+          <TrayButton onClick={() => zoomBy(2)} label="Zoom in">
+            <Plus className="h-3.5 w-3.5" />
+          </TrayButton>
+        </Tray>
+      </div>
     </div>
   );
 }
