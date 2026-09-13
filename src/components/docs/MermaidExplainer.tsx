@@ -3,6 +3,7 @@ import { ChevronLeft, ChevronRight, LoaderCircle, Pause, Play, RotateCcw } from 
 import { readGraph } from "@/lib/explainer/graph";
 import { planExplainer } from "@/lib/explainer/plan";
 import { applySemantics } from "@/lib/explainer/semantics";
+import { largeDiagramMermaidConfig } from "./mermaid-config";
 import { clearRenderArtifacts, describeRenderError } from "./render-error";
 import { ExplainerPlayer, type PlayerState } from "@/lib/explainer/player";
 import { Tray, TrayButton } from "./Mermaid";
@@ -95,8 +96,7 @@ export function MermaidExplainer({
         mermaid.initialize({
           startOnLoad: false,
           theme: dark ? "dark" : "default",
-          securityLevel: "loose",
-          fontFamily: "ui-sans-serif, system-ui, sans-serif",
+          ...largeDiagramMermaidConfig(),
         });
         const { svg } = await mermaid.render(id, code);
         if (disposed) return;
