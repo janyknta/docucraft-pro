@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   Trash2,
   Star,
@@ -10,12 +10,22 @@ import {
   ScrollText,
   Files,
   Sparkles,
-  Archive,
   Pencil,
   X,
 } from "lucide-react";
+import {
+  CUSTOM_FONT_ACCEPT,
+  CUSTOM_FONT_FAMILY,
+  deleteCustomFont,
+  getCustomFont,
+  isSupportedFontFile,
+  putCustomFont,
+  registerCustomFont,
+  unregisterCustomFont,
+} from "@/lib/custom-font";
 import { AiSettings } from "./ai/AiSettings";
 import { Section, Group, Row, Empty, IconButton } from "./settings/primitives";
+import { Switch } from "@/components/ui/switch";
 import type { Highlight } from "@/lib/dom-highlighter";
 import type { MdFile } from "@/lib/markdown-utils";
 import type { ThemePref, ReadingMode, ReadingFont } from "@/lib/persistence";
@@ -44,20 +54,36 @@ export interface SettingsPageProps {
   onSetReadingMode: (mode: ReadingMode) => void;
   readingFont: ReadingFont;
   onSetReadingFont: (font: ReadingFont) => void;
+  diagramColors: boolean;
+  onSetDiagramColors: (on: boolean) => void;
+  aiEnabled: boolean;
+  onSetAiEnabled: (on: boolean) => void;
   onToggleArchiveFile: (id: string) => void;
+  /** Workspace file actions, moved here out of the workspace menus. */
+  onImportWorkspace: (file: File) => void;
+  onExportWorkspace: () => void;
+  onShareWorkspace: () => void;
+  /** Section to open on. Defaults to appearance. */
+  initialTab?: TabId;
   /** Dismiss the dialog. */
   onClose: () => void;
 }
 
-type TabId = "appearance" | "ai" | "workspace" | "archive" | "storage";
+type TabId = "appearance" | "ai" | "workspace" | "saved" | "storage";
 
 const TABS = [
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "ai", label: "Ask AI", icon: Sparkles },
   { id: "workspace", label: "Workspace", icon: Folder },
-  { id: "archive", label: "Archive", icon: Archive },
+  { id: "saved", label: "Saved", icon: Star },
   { id: "storage", label: "Storage", icon: Database },
 ] as const satisfies readonly { id: TabId; label: string; icon: typeof Palette }[];
+
+/** The AI tab disappears entirely when AI is switched off, rather than being
+ *  shown as a dead entry — the point of the switch is not to see it. */
+function visibleTabs(aiEnabled: boolean) {
+  return TABS.filter((tab) => tab.id !== "ai" || aiEnabled);
+}
 
 export function SettingsPage({
   workspaces,
@@ -81,10 +107,24 @@ export function SettingsPage({
   onSetReadingMode,
   readingFont,
   onSetReadingFont,
+  diagramColors,
+  onSetDiagramColors,
+  aiEnabled,
+  onSetAiEnabled,
   onToggleArchiveFile,
+  onImportWorkspace,
+  onExportWorkspace,
+  onShareWorkspace,
+  initialTab,
   onClose,
 }: SettingsPageProps) {
-  const [activeTab, setActiveTab] = useState<TabId>("appearance");
+  const [activeTab, setActiveTab] = useState<TabId>(initialTab ?? "appearance");
+
+  // The dialog survives across opens, so seeding state at mount is not enough:
+  // asking for a section on a later open has to move the tab too.
+  useEffect(() => {
+    if (initialTab) setActiveTab(initialTab);
+  }, [initialTab]);
 
   // Escape closes it, like every other dismissable layer in the app.
   useEffect(() => {
@@ -135,12 +175,16 @@ export function SettingsPage({
         <div className="flex min-h-0 flex-1 flex-col sm:flex-row">
           {/* Left rail on desktop; a scrollable chip row on phones, where a
               vertical rail would eat half the dialog. */}
+          {/* The rail marks the current section with a hairline and weight
+              rather than a filled pill. Five pills stacked down the side read
+              as five competing buttons; the reader only needs to know which
+              one they are in. */}
           <nav
             role="tablist"
             aria-label="Settings sections"
-            className="flex shrink-0 gap-1 overflow-x-auto border-b border-border p-2 scrollbar-hide sm:w-52 sm:flex-col sm:overflow-x-visible sm:overflow-y-auto sm:border-b-0 sm:border-r sm:p-3"
+            className="flex shrink-0 gap-0.5 overflow-x-auto border-b border-border px-2 py-2 scrollbar-hide sm:w-56 sm:flex-col sm:gap-px sm:overflow-x-visible sm:overflow-y-auto sm:border-b-0 sm:border-r sm:px-3 sm:py-4"
           >
-            {TABS.map((tab) => {
+            {visibleTabs(aiEnabled).map((tab) => {
               const Icon = tab.icon;
               const active = activeTab === tab.id;
               return (
@@ -149,13 +193,15 @@ export function SettingsPage({
                   role="tab"
                   aria-selected={active}
                   onClick={() => setActiveTab(tab.id)}
-                  className={`flex shrink-0 items-center gap-2 whitespace-nowrap rounded-lg px-3 py-2 text-[13px] font-medium transition-colors sm:w-full ${
+                  className={`relative flex shrink-0 items-center gap-2.5 whitespace-nowrap rounded-md px-2.5 py-2 text-[13px] transition-colors sm:w-full ${
                     active
-                      ? "bg-accent text-foreground"
-                      : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+                      ? "font-medium text-foreground sm:bg-accent/40"
+                      : "font-normal text-muted-foreground hover:text-foreground"
                   }`}
                 >
-                  <Icon className="h-4 w-4 shrink-0" />
+                  <Icon
+                    className={`h-4 w-4 shrink-0 ${active ? "text-foreground" : "text-muted-foreground/70"}`}
+                  />
                   {tab.label}
                 </button>
               );
@@ -171,18 +217,46 @@ export function SettingsPage({
                 onSetReadingMode={onSetReadingMode}
                 readingFont={readingFont}
                 onSetReadingFont={onSetReadingFont}
+                diagramColors={diagramColors}
+                onSetDiagramColors={onSetDiagramColors}
+                aiEnabled={aiEnabled}
+                onSetAiEnabled={onSetAiEnabled}
               />
             )}
-            {activeTab === "ai" && <AiSettings />}
+            {/* Guarded as well as hidden from the rail: the dialog can be
+                opened straight onto a tab, and a stored "ai" would otherwise
+                land the reader on a pane that no longer has a way back. */}
+            {activeTab === "ai" && aiEnabled && <AiSettings />}
+            {activeTab === "ai" && !aiEnabled && (
+              <AppearanceSettings
+                theme={theme}
+                onSetTheme={onSetTheme}
+                readingMode={readingMode}
+                onSetReadingMode={onSetReadingMode}
+                readingFont={readingFont}
+                onSetReadingFont={onSetReadingFont}
+                diagramColors={diagramColors}
+                onSetDiagramColors={onSetDiagramColors}
+                aiEnabled={aiEnabled}
+                onSetAiEnabled={onSetAiEnabled}
+              />
+            )}
             {activeTab === "workspace" && (
+              <WorkspaceSettings
+                workspaces={workspaces}
+                currentWorkspaceId={currentWorkspaceId}
+                onRename={onRenameWorkspace}
+                onDelete={onDeleteWorkspace}
+                onOpenWorkspace={onOpenWorkspace}
+                onImport={onImportWorkspace}
+                onExport={onExportWorkspace}
+                onShare={onShareWorkspace}
+              />
+            )}
+            {/* Saved gathers everything the reader kept: starred items, their
+                highlights, and the files they archived out of the sidebar. */}
+            {activeTab === "saved" && (
               <div className="space-y-10">
-                <WorkspaceSettings
-                  workspaces={workspaces}
-                  currentWorkspaceId={currentWorkspaceId}
-                  onRename={onRenameWorkspace}
-                  onDelete={onDeleteWorkspace}
-                  onOpenWorkspace={onOpenWorkspace}
-                />
                 <SavedSettings
                   saved={saved}
                   onOpen={onOpenSaved}
@@ -196,10 +270,8 @@ export function SettingsPage({
                   onClearAll={onClearHighlights}
                   onNavigate={onNavigate}
                 />
+                <ArchiveSettings files={files} onUnarchive={onToggleArchiveFile} />
               </div>
-            )}
-            {activeTab === "archive" && (
-              <ArchiveSettings files={files} onUnarchive={onToggleArchiveFile} />
             )}
             {activeTab === "storage" && <StorageSettings onClearStorage={onClearStorage} />}
           </div>
@@ -210,7 +282,8 @@ export function SettingsPage({
 }
 
 // Swatch previews approximate each theme so the picker reads at a glance; the
-// applied theme itself is driven by the CSS token sets in styles.css.
+// applied theme itself is driven by the CSS token sets in styles.css. Two
+// entries only: one palette per ambient light level, both WCAG-checked.
 const READER_THEME_META: {
   id: ThemePref;
   label: string;
@@ -219,28 +292,7 @@ const READER_THEME_META: {
   muted: string;
 }[] = [
   { id: "light", label: "Light", bg: "#ffffff", fg: "#1c1c28", muted: "#6b7280" },
-  { id: "sepia", label: "Sepia", bg: "#f4ecd8", fg: "#4a3f35", muted: "#8a7a68" },
   { id: "dark", label: "Dark", bg: "#0f1420", fg: "#eceef2", muted: "#9aa3b2" },
-  { id: "nord", label: "Nord", bg: "#2e3440", fg: "#eceff4", muted: "#a9b3c4" },
-  { id: "black", label: "Black", bg: "#000000", fg: "#e8e8e8", muted: "#b3b3b3" },
-];
-
-// Explicit font stacks so each preview shows its own face regardless of the
-// currently applied reading font.
-const READING_FONT_META: { id: ReadingFont; label: string; family: string }[] = [
-  {
-    id: "system",
-    label: "System",
-    family: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-  },
-  { id: "serif", label: "Source Serif", family: '"Source Serif 4", ui-serif, Georgia, serif' },
-  { id: "newsreader", label: "Newsreader", family: '"Newsreader", ui-serif, Georgia, serif' },
-  { id: "sans", label: "Inter", family: '"Inter", ui-sans-serif, system-ui, sans-serif' },
-  {
-    id: "hyperlegible",
-    label: "Atkinson Hyperlegible",
-    family: '"Atkinson Hyperlegible", ui-sans-serif, sans-serif',
-  },
 ];
 
 const READING_MODE_META: { id: ReadingMode; label: string; hint: string; icon: typeof Files }[] = [
@@ -255,9 +307,17 @@ function AppearanceSettings({
   onSetReadingMode,
   readingFont,
   onSetReadingFont,
+  diagramColors,
+  onSetDiagramColors,
+  aiEnabled,
+  onSetAiEnabled,
 }: {
   theme: ThemePref;
   onSetTheme: (theme: ThemePref) => void;
+  diagramColors: boolean;
+  onSetDiagramColors: (on: boolean) => void;
+  aiEnabled: boolean;
+  onSetAiEnabled: (on: boolean) => void;
   readingMode: ReadingMode;
   onSetReadingMode: (mode: ReadingMode) => void;
   readingFont: ReadingFont;
@@ -268,7 +328,7 @@ function AppearanceSettings({
       <Section title="Theme">
         {/* The swatch is the whole control — colour carries the meaning, so the
             per-theme description text is gone. */}
-        <div className="grid grid-cols-5 gap-2 sm:gap-3">
+        <div className="grid grid-cols-2 gap-3">
           {READER_THEME_META.map((t) => {
             const active = theme === t.id;
             return (
@@ -305,31 +365,7 @@ function AppearanceSettings({
         </div>
       </Section>
 
-      <Section title="Reading font">
-        {/* Each row previews its own face in the label itself — no separate
-            "Ag" specimen block needed. */}
-        <Group>
-          {READING_FONT_META.map((f) => {
-            const active = readingFont === f.id;
-            return (
-              <button
-                key={f.id}
-                onClick={() => onSetReadingFont(f.id)}
-                aria-pressed={active}
-                className="flex w-full items-center justify-between gap-4 px-4 py-3 text-left transition-colors hover:bg-accent/40"
-              >
-                <span
-                  className="truncate text-base text-foreground"
-                  style={{ fontFamily: f.family }}
-                >
-                  {f.label}
-                </span>
-                {active && <Check className="h-4 w-4 shrink-0 text-primary" />}
-              </button>
-            );
-          })}
-        </Group>
-      </Section>
+      <ReadingFontSettings readingFont={readingFont} onSetReadingFont={onSetReadingFont} />
 
       <Section title="Layout">
         <Group>
@@ -354,6 +390,40 @@ function AppearanceSettings({
           })}
         </Group>
       </Section>
+
+      {/* Colour is a reading aid, so it sits with the other reading choices
+          rather than in a diagrams-only corner the reader would never open. */}
+      <Section title="Diagrams">
+        <Group>
+          <Row
+            label="Colour by meaning"
+            hint="Green for success, red for failure, amber for decisions and retries. Applies to Raw and Stepped."
+            control={
+              <Switch
+                checked={diagramColors}
+                onCheckedChange={onSetDiagramColors}
+                aria-label="Colour diagrams by meaning"
+              />
+            }
+          />
+        </Group>
+      </Section>
+
+      <Section title="AI">
+        <Group>
+          <Row
+            label="AI features"
+            hint="Off removes Ask AI everywhere — the panel, the selection menu, and this section's settings."
+            control={
+              <Switch
+                checked={aiEnabled}
+                onCheckedChange={onSetAiEnabled}
+                aria-label="Enable AI features"
+              />
+            }
+          />
+        </Group>
+      </Section>
     </div>
   );
 }
@@ -364,28 +434,230 @@ function WorkspaceSettings({
   onRename,
   onDelete,
   onOpenWorkspace,
+  onImport,
+  onExport,
+  onShare,
 }: {
   workspaces: { id: string; name: string }[];
   currentWorkspaceId: string | null;
   onRename: (id: string, name: string) => void;
   onDelete: (id: string) => void;
   onOpenWorkspace: (id: string) => void;
+  onImport: (file: File) => void;
+  onExport: () => void;
+  onShare: () => void;
 }) {
+  const fileRef = useRef<HTMLInputElement>(null);
+
   return (
-    <Section title="Workspaces">
-      <Group>
-        {workspaces.map((ws) => (
-          <WorkspaceItemRow
-            key={ws.id}
-            workspace={ws}
-            isCurrent={ws.id === currentWorkspaceId}
-            onRename={onRename}
-            onDelete={onDelete}
-            onOpen={onOpenWorkspace}
-            canDelete={workspaces.length > 1}
+    <div className="space-y-10">
+      <Section title="Workspaces">
+        <Group>
+          {workspaces.map((ws) => (
+            <WorkspaceItemRow
+              key={ws.id}
+              workspace={ws}
+              isCurrent={ws.id === currentWorkspaceId}
+              onRename={onRename}
+              onDelete={onDelete}
+              onOpen={onOpenWorkspace}
+              canDelete={workspaces.length > 1}
+            />
+          ))}
+        </Group>
+      </Section>
+
+      {/* Moved out of the workspace menus: occasional actions on the whole
+          workspace, grouped where the workspaces themselves are managed. */}
+      <Section title="Transfer">
+        <Group>
+          <Row
+            label="Import workspace"
+            hint="Add a workspace from an exported .json file"
+            control={
+              <button
+                onClick={() => fileRef.current?.click()}
+                className="rounded-md px-3 py-1.5 text-sm font-medium text-primary transition-colors hover:bg-primary/10"
+              >
+                Choose file
+              </button>
+            }
           />
-        ))}
+          <Row
+            label="Export workspace"
+            hint="Download the current workspace as .json"
+            control={
+              <button
+                onClick={onExport}
+                className="rounded-md px-3 py-1.5 text-sm font-medium text-primary transition-colors hover:bg-primary/10"
+              >
+                Export
+              </button>
+            }
+          />
+          <Row
+            label="Share workspace"
+            hint="Create a link to the current workspace"
+            control={
+              <button
+                onClick={onShare}
+                className="rounded-md px-3 py-1.5 text-sm font-medium text-primary transition-colors hover:bg-primary/10"
+              >
+                Share
+              </button>
+            }
+          />
+        </Group>
+      </Section>
+
+      <input
+        ref={fileRef}
+        type="file"
+        accept="application/json,.json"
+        className="hidden"
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) onImport(f);
+          e.target.value = "";
+        }}
+      />
+    </div>
+  );
+}
+
+/**
+ * The reading face: one bundled typeface, plus whatever the reader uploads.
+ *
+ * The font file is held in IndexedDB rather than the prefs blob (binaries do
+ * not belong in localStorage) and registered with the FontFace API under a
+ * fixed family name that `[data-font="custom"]` points at.
+ */
+function ReadingFontSettings({
+  readingFont,
+  onSetReadingFont,
+}: {
+  readingFont: ReadingFont;
+  onSetReadingFont: (font: ReadingFont) => void;
+}) {
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [customName, setCustomName] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getCustomFont().then((record) => {
+      if (!cancelled) setCustomName(record?.name ?? null);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleFile = async (file: File) => {
+    setError(null);
+    if (!isSupportedFontFile(file)) {
+      setError("Use a .ttf, .otf, .woff or .woff2 file.");
+      return;
+    }
+    setBusy(true);
+    try {
+      // Register before storing: an unreadable file should fail here and leave
+      // whatever was already working in place.
+      await registerCustomFont(file);
+      await putCustomFont({ name: file.name, blob: file });
+      setCustomName(file.name);
+      onSetReadingFont("custom");
+    } catch {
+      setError("That file could not be read as a font.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRemove = async () => {
+    await deleteCustomFont();
+    unregisterCustomFont();
+    setCustomName(null);
+    if (readingFont === "custom") onSetReadingFont("hyperlegible");
+  };
+
+  return (
+    <Section title="Reading font">
+      <Group>
+        <button
+          onClick={() => onSetReadingFont("hyperlegible")}
+          aria-pressed={readingFont === "hyperlegible"}
+          className="flex w-full items-center justify-between gap-4 px-4 py-3 text-left transition-colors hover:bg-accent/40"
+        >
+          <span className="min-w-0">
+            <span
+              className="block truncate text-base text-foreground"
+              style={{ fontFamily: '"Atkinson Hyperlegible", ui-sans-serif, sans-serif' }}
+            >
+              Atkinson Hyperlegible
+            </span>
+            <span className="mt-0.5 block truncate text-xs text-muted-foreground">
+              Drawn for maximum letterform distinction
+            </span>
+          </span>
+          {readingFont === "hyperlegible" && <Check className="h-4 w-4 shrink-0 text-primary" />}
+        </button>
+
+        {customName ? (
+          <div className="flex items-center gap-2 pr-2 transition-colors hover:bg-accent/40">
+            <button
+              onClick={() => onSetReadingFont("custom")}
+              aria-pressed={readingFont === "custom"}
+              className="flex min-w-0 flex-1 items-center justify-between gap-4 px-4 py-3 text-left"
+            >
+              <span className="min-w-0">
+                <span
+                  className="block truncate text-base text-foreground"
+                  style={{ fontFamily: `"${CUSTOM_FONT_FAMILY}", ui-sans-serif, sans-serif` }}
+                >
+                  {customName}
+                </span>
+                <span className="mt-0.5 block truncate text-xs text-muted-foreground">
+                  Your font
+                </span>
+              </span>
+              {readingFont === "custom" && <Check className="h-4 w-4 shrink-0 text-primary" />}
+            </button>
+            <IconButton onClick={() => void handleRemove()} label="Remove custom font" danger>
+              <Trash2 className="h-4 w-4" />
+            </IconButton>
+          </div>
+        ) : (
+          <Row
+            label="Your own font"
+            hint="Upload a .ttf, .otf, .woff or .woff2"
+            control={
+              <button
+                onClick={() => fileRef.current?.click()}
+                disabled={busy}
+                className="rounded-md px-3 py-1.5 text-sm font-medium text-primary transition-colors hover:bg-primary/10 disabled:opacity-50"
+              >
+                {busy ? "Loading…" : "Upload"}
+              </button>
+            }
+          />
+        )}
       </Group>
+
+      {error && <p className="px-1 text-xs text-destructive">{error}</p>}
+
+      <input
+        ref={fileRef}
+        type="file"
+        accept={CUSTOM_FONT_ACCEPT}
+        className="hidden"
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) void handleFile(f);
+          e.target.value = "";
+        }}
+      />
     </Section>
   );
 }

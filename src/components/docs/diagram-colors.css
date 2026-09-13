@@ -1,0 +1,158 @@
+/*
+ * Semantic diagram colours.
+ *
+ * A diagram's parts are tagged with `data-role` by the renderer (see
+ * `lib/explainer/semantics.ts`), and this file is the only place that decides
+ * what a role looks like. Keeping the palette here rather than in the tagging
+ * code means light and dark can answer the same role differently, and a reader
+ * who turns the feature off simply never gets the attribute.
+ *
+ * Applied in Raw and Stepped. Flow is left alone: the animator already colours
+ * by travelling packet, and a second colour system on top of it would fight.
+ *
+ * Only the stroke and the text are coloured, never a large fill. A wall of
+ * saturated boxes is harder to read than the neutral diagram it replaced; a
+ * coloured edge and label give the same signal at a fraction of the ink. The
+ * one exception is a faint tint, low enough to sit under text safely in both
+ * themes.
+ */
+
+/*
+ * Light values are darkened past the obvious choice on purpose. Measured
+ * against the real surfaces — the frame is `muted/30` over the page, which
+ * comes out near-white — Tailwind's 700-weight green, amber and yellow land at
+ * 4.34–4.40 against their own tint: under WCAG AA for text. The 800-weight
+ * versions clear it with room to spare, and at this size the hue still reads as
+ * green/amber rather than "dark".
+ */
+:root {
+  --diagram-success: #166534;
+  --diagram-success-tint: #16653414;
+  --diagram-failure: #b91c1c;
+  --diagram-failure-tint: #b91c1c14;
+  --diagram-warning: #92400e;
+  --diagram-warning-tint: #92400e14;
+  --diagram-decision: #854d0e;
+  --diagram-decision-tint: #854d0e14;
+  --diagram-storage: #1d4ed8;
+  --diagram-storage-tint: #1d4ed814;
+  --diagram-security: #7e22ce;
+  --diagram-security-tint: #7e22ce14;
+  /* Teal-700 measured 2.98 against the surface these nodes actually land on —
+     an outright AA failure, and the one colour a reader called out. 800 clears
+     it without losing the teal. */
+  --diagram-external: #115e59;
+  --diagram-external-tint: #115e5914;
+  --diagram-terminal: #52525b;
+  --diagram-terminal-tint: #52525b14;
+}
+
+.dark {
+  /* Lifted for contrast against a dark surface; the hues are the same so a
+     diagram does not change meaning between themes. */
+  --diagram-success: #4ade80;
+  --diagram-success-tint: #4ade8018;
+  --diagram-failure: #f87171;
+  --diagram-failure-tint: #f8717118;
+  --diagram-warning: #fbbf24;
+  --diagram-warning-tint: #fbbf2418;
+  --diagram-decision: #fcd34d;
+  --diagram-decision-tint: #fcd34d18;
+  --diagram-storage: #60a5fa;
+  --diagram-storage-tint: #60a5fa18;
+  --diagram-security: #c084fc;
+  --diagram-security-tint: #c084fc18;
+  --diagram-external: #2dd4bf;
+  --diagram-external-tint: #2dd4bf18;
+  --diagram-terminal: #a1a1aa;
+  --diagram-terminal-tint: #a1a1aa18;
+}
+
+/* Nodes: coloured outline, faint tint, coloured label. */
+.diagram-colored [data-role="success"] rect,
+.diagram-colored [data-role="success"] polygon,
+.diagram-colored [data-role="success"] circle,
+.diagram-colored [data-role="success"] ellipse,
+.diagram-colored [data-role="success"] path {
+  stroke: var(--diagram-success) !important;
+  fill: var(--diagram-success-tint) !important;
+}
+.diagram-colored [data-role="failure"] rect,
+.diagram-colored [data-role="failure"] polygon,
+.diagram-colored [data-role="failure"] circle,
+.diagram-colored [data-role="failure"] ellipse,
+.diagram-colored [data-role="failure"] path {
+  stroke: var(--diagram-failure) !important;
+  fill: var(--diagram-failure-tint) !important;
+}
+.diagram-colored [data-role="warning"] rect,
+.diagram-colored [data-role="warning"] polygon,
+.diagram-colored [data-role="warning"] circle,
+.diagram-colored [data-role="warning"] ellipse,
+.diagram-colored [data-role="warning"] path {
+  stroke: var(--diagram-warning) !important;
+  fill: var(--diagram-warning-tint) !important;
+}
+.diagram-colored [data-role="decision"] rect,
+.diagram-colored [data-role="decision"] polygon,
+.diagram-colored [data-role="decision"] circle,
+.diagram-colored [data-role="decision"] ellipse,
+.diagram-colored [data-role="decision"] path {
+  stroke: var(--diagram-decision) !important;
+  fill: var(--diagram-decision-tint) !important;
+}
+.diagram-colored [data-role="storage"] rect,
+.diagram-colored [data-role="storage"] polygon,
+.diagram-colored [data-role="storage"] circle,
+.diagram-colored [data-role="storage"] ellipse,
+.diagram-colored [data-role="storage"] path {
+  stroke: var(--diagram-storage) !important;
+  fill: var(--diagram-storage-tint) !important;
+}
+.diagram-colored [data-role="security"] rect,
+.diagram-colored [data-role="security"] polygon,
+.diagram-colored [data-role="security"] circle,
+.diagram-colored [data-role="security"] ellipse,
+.diagram-colored [data-role="security"] path {
+  stroke: var(--diagram-security) !important;
+  fill: var(--diagram-security-tint) !important;
+}
+.diagram-colored [data-role="external"] rect,
+.diagram-colored [data-role="external"] polygon,
+.diagram-colored [data-role="external"] circle,
+.diagram-colored [data-role="external"] ellipse,
+.diagram-colored [data-role="external"] path {
+  stroke: var(--diagram-external) !important;
+  fill: var(--diagram-external-tint) !important;
+}
+.diagram-colored [data-role="terminal"] rect,
+.diagram-colored [data-role="terminal"] polygon,
+.diagram-colored [data-role="terminal"] circle,
+.diagram-colored [data-role="terminal"] ellipse,
+.diagram-colored [data-role="terminal"] path {
+  stroke: var(--diagram-terminal) !important;
+  fill: var(--diagram-terminal-tint) !important;
+}
+
+/* Labels follow their node's role. */
+.diagram-colored [data-role="success"] .nodeLabel { color: var(--diagram-success) !important; }
+.diagram-colored [data-role="failure"] .nodeLabel { color: var(--diagram-failure) !important; }
+.diagram-colored [data-role="warning"] .nodeLabel { color: var(--diagram-warning) !important; }
+.diagram-colored [data-role="decision"] .nodeLabel { color: var(--diagram-decision) !important; }
+.diagram-colored [data-role="storage"] .nodeLabel { color: var(--diagram-storage) !important; }
+.diagram-colored [data-role="security"] .nodeLabel { color: var(--diagram-security) !important; }
+.diagram-colored [data-role="external"] .nodeLabel { color: var(--diagram-external) !important; }
+.diagram-colored [data-role="terminal"] .nodeLabel { color: var(--diagram-terminal) !important; }
+
+/* Edges carry their own verdict — a "no" branch is red all the way along it,
+   not only at the box it lands in. */
+.diagram-colored path[data-role="success"],
+.diagram-colored line[data-role="success"] { stroke: var(--diagram-success) !important; }
+.diagram-colored path[data-role="failure"],
+.diagram-colored line[data-role="failure"] { stroke: var(--diagram-failure) !important; }
+.diagram-colored path[data-role="warning"],
+.diagram-colored line[data-role="warning"] { stroke: var(--diagram-warning) !important; }
+
+.diagram-colored [data-edge-role="success"] .edgeLabel { color: var(--diagram-success) !important; }
+.diagram-colored [data-edge-role="failure"] .edgeLabel { color: var(--diagram-failure) !important; }
+.diagram-colored [data-edge-role="warning"] .edgeLabel { color: var(--diagram-warning) !important; }

@@ -34,7 +34,18 @@ export default defineConfig({
     // dependency tree — cytoscape, dagre, d3 — into the dev-server warm-up and
     // encouraged it back into the initial graph.
     exclude: ["mermaid", "@babel/standalone", "xlsx", "mammoth"],
-    include: ["dayjs", "@braintree/sanitize-url"],
+    // `cytoscape-cose-bilkent` (mermaid's mindmap layout) ships CommonJS only —
+    // no `module`, no `exports` — and because `mermaid` is excluded above, Vite
+    // never converts it, so importing a mindmap died with "does not provide an
+    // export named default". Pre-bundling just the CJS leaf fixes the import
+    // without dragging mermaid itself back into the warm-up.
+    include: [
+      "dayjs",
+      "@braintree/sanitize-url",
+      "cytoscape",
+      "cytoscape-cose-bilkent",
+      "cytoscape-fcose",
+    ],
   },
   build: {
     // Terser-grade minification is worth the build time here: the app ships a

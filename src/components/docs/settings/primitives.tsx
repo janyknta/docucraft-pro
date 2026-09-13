@@ -18,15 +18,16 @@ export function Section({
   action?: ReactNode;
   children: ReactNode;
 }) {
+  // Sentence case at text size, not shouty small-caps: a settings page is a
+  // list of choices, and the headings are signposts between them rather than
+  // labels demanding attention of their own.
   return (
-    <section className="space-y-3">
-      <div className="flex items-end justify-between gap-4 px-1">
+    <section className="space-y-2.5">
+      <div className="flex items-end justify-between gap-4 px-0.5">
         <div className="min-w-0">
-          <h2 className="text-[13px] font-semibold uppercase tracking-wider text-muted-foreground">
-            {title}
-          </h2>
+          <h2 className="text-[13px] font-semibold tracking-tight text-foreground">{title}</h2>
           {description && (
-            <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">{description}</p>
+            <p className="mt-1 text-[13px] leading-relaxed text-muted-foreground">{description}</p>
           )}
         </div>
         {action}

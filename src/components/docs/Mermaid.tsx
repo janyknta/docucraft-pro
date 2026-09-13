@@ -1,20 +1,137 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import {
-  Download,
-  Expand,
-  Home,
-  LoaderCircle,
-  Minus,
-  Pause,
-  Play,
-  Plus,
-  Star,
-  X,
-} from "lucide-react";
+import { Download, Expand, LoaderCircle, Minus, Plus, Star, X } from "lucide-react";
 import { toast } from "sonner";
 import { MermaidAnimator, type MermaidAnimator as MermaidAnimatorInstance } from "mermaid-animator";
 import { useSaveAction } from "./save-action";
+import { applySemantics } from "@/lib/explainer/semantics";
+import { clearRenderArtifacts, describeRenderError } from "./render-error";
+import {
+  MAX_STAGE_RATIO,
+  MIN_STAGE_RATIO,
+  clampStageRatio,
+  isTallStage,
+  stageBoxStyle,
+  stageWidthCap,
+  type DiagramSize,
+} from "./stage-ratio";
+
+/** A tall stage takes the full column, so it gets no width cap at all. */
+function widthCap(ratio: number): string | undefined {
+  const cap = stageWidthCap(ratio);
+  return cap ? `calc(${cap})` : undefined;
+}
+
+/**
+ * Explainer mode renders through plain `mermaid` rather than the animator, so
+ * it is a separate chunk. Splitting it keeps a reader who never switches modes
+ * from downloading the planner and player at all.
+ */
+const MermaidExplainer = lazy(() =>
+  import("./MermaidExplainer").then((m) => ({ default: m.MermaidExplainer })),
+);
+
+/**
+ * How a diagram is presented.
+ *
+ * `raw` is Mermaid exactly as it renders, with no motion. `stepped` walks the
+ * graph one edge at a time, revealing each node as the arrow reaches it — the
+ * explainer. `flow` is the continuous animation: packets travelling every edge
+ * at once, plus the `flow:` choreography and WebM export that belong to it.
+ *
+ * Ordered as the reader would escalate: the picture, then the walk through it,
+ * then the thing in motion.
+ */
+export type MermaidMode = "raw" | "stepped" | "flow";
+
+const MODE_ORDER: MermaidMode[] = ["raw", "stepped", "flow"];
+const MODE_LABEL: Record<MermaidMode, string> = {
+  raw: "Raw",
+  stepped: "Stepped",
+  flow: "Flow",
+};
+const MODE_HINT: Record<MermaidMode, string> = {
+  raw: "The diagram, no animation",
+  stepped: "Walk the graph one step at a time",
+  flow: "Continuous flow along every edge",
+};
+
+/**
+ * The three presentations, as one segmented control.
+ *
+ * A tablist rather than a cycling button: the modes are siblings, and a reader
+ * should be able to see all three and pick one, not discover them by pressing
+ * the same key repeatedly. Labels are words because "Raw" and "Stepped" have no
+ * icon anyone would read correctly.
+ */
+function ModeTabs({
+  mode,
+  onChange,
+  unavailable,
+}: {
+  mode: MermaidMode;
+  onChange: (next: MermaidMode) => void;
+  /** Modes this diagram cannot offer, with the reason, shown disabled. */
+  unavailable?: Partial<Record<MermaidMode, string>>;
+}) {
+  const blocked = (option: MermaidMode) => Boolean(unavailable?.[option]);
+
+  const onKeyDown = (event: React.KeyboardEvent) => {
+    const delta = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+    if (!delta) return;
+    event.preventDefault();
+    // Step over anything disabled rather than landing on it, so the arrow keys
+    // can only reach a tab that will actually do something.
+    let index = MODE_ORDER.indexOf(mode);
+    for (let hops = 0; hops < MODE_ORDER.length; hops++) {
+      index = (index + delta + MODE_ORDER.length) % MODE_ORDER.length;
+      if (!blocked(MODE_ORDER[index])) {
+        onChange(MODE_ORDER[index]);
+        return;
+      }
+    }
+  };
+
+  return (
+    <div
+      role="tablist"
+      aria-label="Diagram presentation"
+      onKeyDown={onKeyDown}
+      className="pointer-events-auto flex items-center overflow-hidden rounded-lg border border-border/70 bg-background/85 p-0.5 shadow-sm ring-1 ring-black/2 backdrop-blur-md"
+    >
+      {MODE_ORDER.map((option) => {
+        const selected = option === mode;
+        const reason = unavailable?.[option];
+        return (
+          <button
+            key={option}
+            type="button"
+            role="tab"
+            aria-selected={selected}
+            // `aria-disabled` rather than `disabled`: the tab stays focusable
+            // and keeps its tooltip, so a reader can find out *why* it is off
+            // instead of meeting a control that ignores them silently.
+            aria-disabled={reason ? true : undefined}
+            // Only the active tab is in the tab order; arrow keys move between
+            // them, which is how a tablist is meant to behave.
+            tabIndex={selected ? 0 : -1}
+            title={reason ?? MODE_HINT[option]}
+            onClick={() => !reason && onChange(option)}
+            className={`inline-flex h-7 items-center rounded-md px-2.5 text-[11px] font-medium transition-colors duration-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${
+              reason
+                ? "cursor-not-allowed text-muted-foreground/40"
+                : selected
+                  ? "bg-accent text-foreground"
+                  : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            {MODE_LABEL[option]}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
 
 // mermaid's erDiagram lexer reserves words like CLASS. Keep the existing
 // compatibility fallback, but only apply it after the unmodified source fails.
@@ -43,10 +160,28 @@ function baseName(name: string) {
   return name.replace(/\.(mmd|mermaid|md|markdown)$/i, "") || "diagram";
 }
 
-export function Mermaid({ code, name = "diagram" }: { code: string; name?: string }) {
+export function Mermaid({
+  code,
+  name = "diagram",
+  mode: initialMode = "raw",
+}: {
+  code: string;
+  name?: string;
+  /** Starting presentation. Readers can switch from the tray. */
+  mode?: MermaidMode;
+}) {
   const [fullscreen, setFullscreen] = useState(false);
+  const [mode, setMode] = useState<MermaidMode>(initialMode);
   const [dark, setDark] = useState(
     () => typeof document !== "undefined" && document.documentElement.classList.contains("dark"),
+  );
+  // Semantic colouring is a reader preference, published on <html> the same way
+  // theme and font are. A diagram lives deep inside rendered markdown with no
+  // props reaching it, so the attribute is the channel.
+  const [colored, setColored] = useState(
+    () =>
+      typeof document === "undefined" ||
+      document.documentElement.getAttribute("data-diagram-colors") !== "off",
   );
   const [renderError, setRenderError] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
@@ -56,18 +191,40 @@ export function Mermaid({ code, name = "diagram" }: { code: string; name?: strin
   // Present when the markdown viewer has delegated its save star to this tray.
   const saveAction = useSaveAction();
   const source = code.trim();
-  const frameCap = stageRatio ? `calc(min(32rem, 70vh) / ${stageRatio})` : null;
+  const frameCap = stageRatio ? (widthCap(stageRatio) ?? null) : null;
+
+  /**
+   * A diagram with no sequence to walk — a sequence diagram, a timeline, an
+   * xychart — has nothing for stepped mode to do.
+   *
+   * The tab is disabled rather than the mode being switched out from under the
+   * reader. Silently flipping to Raw made the Stepped tab look broken (you
+   * pressed it and it bounced back, unexplained), and because the report
+   * arrives from the stage's own async render, calling `setMode` there updated
+   * the parent while the child was still mounting.
+   */
+  const [steppedUnavailable, setSteppedUnavailable] = useState(false);
+  const handleUnsupported = useCallback(() => setSteppedUnavailable(true), []);
+  // A new diagram deserves a fresh verdict; the old one's may not apply.
+  useEffect(() => setSteppedUnavailable(false), [source]);
 
   useEffect(() => {
     const root = document.documentElement;
-    const observer = new MutationObserver(() => setDark(root.classList.contains("dark")));
-    observer.observe(root, { attributes: true, attributeFilter: ["class"] });
+    const observer = new MutationObserver(() => {
+      setDark(root.classList.contains("dark"));
+      setColored(root.getAttribute("data-diagram-colors") !== "off");
+    });
+    observer.observe(root, {
+      attributes: true,
+      attributeFilter: ["class", "data-diagram-colors"],
+    });
     return () => observer.disconnect();
   }, []);
 
-  // A syntax error removes the stage. Clear it when the source or theme changes
-  // so editing the diagram immediately gets a fresh render attempt.
-  useEffect(() => setRenderError(null), [source, dark]);
+  // A syntax error removes the stage. Clear it when the source, theme or mode
+  // changes so editing the diagram — or switching renderer — immediately gets a
+  // fresh render attempt rather than staying stuck on the previous failure.
+  useEffect(() => setRenderError(null), [source, dark, mode]);
 
   useEffect(() => {
     if (!fullscreen) return;
@@ -136,6 +293,92 @@ export function Mermaid({ code, name = "diagram" }: { code: string; name?: strin
     </TrayButton>
   ) : null;
 
+  const unavailable = steppedUnavailable
+    ? { stepped: "This diagram has no sequence to step through" }
+    : undefined;
+
+  const modeControl = <ModeTabs mode={mode} onChange={setMode} unavailable={unavailable} />;
+
+  // An unsupported diagram still has to show something: render it raw while
+  // leaving the reader's chosen tab alone.
+  const effectiveMode: MermaidMode = mode === "stepped" && steppedUnavailable ? "raw" : mode;
+
+  /**
+   * The bar above the diagram: what mode you are in, and what you can do to the
+   * diagram as an object.
+   *
+   * Deliberately fixed rather than hover-revealed. Switching presentation is
+   * navigation, and navigation you cannot see is navigation nobody finds — the
+   * previous floating tray hid the tabs until the pointer happened to land on
+   * the picture. Playback stays down on the artwork, next to the thing it
+   * drives; this row is chrome.
+   *
+   * The WebM export appears in `flow` alone: it encodes the travelling-packet
+   * animation, so offering it beside a still picture or a step-through would
+   * hand back a file of something the reader is not looking at.
+   */
+  const header = (
+    <div className="flex items-center justify-between gap-3 border-b border-border/70 bg-background/40 px-2 py-1.5">
+      {modeControl}
+      {/* Plain icons rather than an overflow menu. There are only ever two or
+          three of these, and a menu made the reader open something to find out
+          it held almost nothing. Each one appears only where it applies, so
+          nothing needs hiding. */}
+      <Tray>
+        {saveControl}
+        {effectiveMode === "flow" ? downloadControl : null}
+        <TrayButton onClick={() => setFullscreen(true)} label="Fullscreen">
+          <Expand className="h-3.5 w-3.5" />
+        </TrayButton>
+      </Tray>
+    </div>
+  );
+
+  const stageFor = (stageFill: boolean) => {
+    // Nothing is passed down any more: the surrounding controls live in the
+    // header, and each stage renders only its own playback.
+    const controls = undefined;
+    if (effectiveMode === "stepped") {
+      return (
+        <Suspense fallback={<StageSpinner label="Loading explainer…" />}>
+          <MermaidExplainer
+            code={source}
+            dark={dark}
+            colored={colored}
+            fill={stageFill}
+            controls={controls}
+            onError={setRenderError}
+            onRatio={stageFill ? undefined : setStageRatio}
+            onUnsupported={handleUnsupported}
+          />
+        </Suspense>
+      );
+    }
+    if (effectiveMode === "raw") {
+      return (
+        <StaticStage
+          code={source}
+          dark={dark}
+          colored={colored}
+          fill={stageFill}
+          controls={controls}
+          onError={setRenderError}
+          onRatio={stageFill ? undefined : setStageRatio}
+        />
+      );
+    }
+    return (
+      <AnimatorStage
+        code={source}
+        dark={dark}
+        fill={stageFill}
+        controls={controls}
+        onError={setRenderError}
+        onRatio={stageFill ? undefined : setStageRatio}
+      />
+    );
+  };
+
   return (
     <>
       {/* The frame hugs the stage rather than the column: a tall diagram is
@@ -147,25 +390,8 @@ export function Mermaid({ code, name = "diagram" }: { code: string; name?: strin
         className="mermaid-frame my-6 overflow-hidden rounded-xl border border-border bg-muted/30 mx-auto"
         style={frameCap ? { maxWidth: frameCap } : undefined}
       >
-        {renderError ? (
-          <MermaidError error={renderError} />
-        ) : (
-          <AnimatorStage
-            code={source}
-            dark={dark}
-            onError={setRenderError}
-            onRatio={setStageRatio}
-            controls={
-              <>
-                {saveControl}
-                {downloadControl}
-                <TrayButton onClick={() => setFullscreen(true)} label="Fullscreen">
-                  <Expand className="h-3.5 w-3.5" />
-                </TrayButton>
-              </>
-            }
-          />
-        )}
+        {header}
+        {renderError ? <MermaidError error={renderError} /> : stageFor(false)}
       </div>
 
       {fullscreen &&
@@ -185,23 +411,22 @@ export function Mermaid({ code, name = "diagram" }: { code: string; name?: strin
               <header className="flex h-14 shrink-0 items-center justify-between gap-3 border-b border-border px-4 sm:px-6">
                 <div>
                   <h1 className="text-sm font-semibold text-foreground">{baseName(name)}</h1>
-                  <p className="text-[11px] text-muted-foreground">Animated Mermaid</p>
+                  <p className="text-[11px] text-muted-foreground">{MODE_HINT[mode]}</p>
                 </div>
                 <div className="flex items-center gap-2">
+                  {modeControl}
                   <Tray>
                     {saveControl}
-                    {downloadControl}
+                    {effectiveMode === "flow" ? downloadControl : null}
                   </Tray>
-                  <Tray>
+                  <Tray key="close">
                     <TrayButton onClick={() => setFullscreen(false)} label="Close diagram">
                       <X className="h-4 w-4" />
                     </TrayButton>
                   </Tray>
                 </div>
               </header>
-              <div className="min-h-0 flex-1">
-                <AnimatorStage code={source} dark={dark} fill onError={setRenderError} />
-              </div>
+              <div className="min-h-0 flex-1">{stageFor(true)}</div>
             </div>
           </div>,
           document.body,
@@ -219,32 +444,27 @@ export function Mermaid({ code, name = "diagram" }: { code: string; name?: strin
 // The floor is low deliberately: a left-to-right flow of four or five nodes is
 // genuinely around 0.3, and clamping it to something squarer reintroduces the
 // exact dead band this measurement exists to remove.
-const MIN_STAGE_RATIO = 0.26,
-  MAX_STAGE_RATIO = 1.6;
+// The ratio band every stage sizes itself by lives in its own module, so all
+// three stages share one definition. See stage-ratio.ts for why it is clamped.
 // The control row floats over the diagram's bottom edge. Adding its height to
 // the stage keeps it off the artwork instead of parked on the last node.
 const TRAY_GUTTER = 56;
 
-/** Zoom by rewriting the SVG viewBox — the same maths the animator's own wheel
- *  handler uses, reachable here because that handler is off and its PanZoom
- *  instance is private to the package. */
 const ZOOM_LIMIT = { min: 0.2, max: 8 };
-function zoomStage(container: HTMLElement | null, factor: number) {
-  const svg = container?.querySelector("svg");
-  const view = svg?.viewBox.baseVal;
-  if (!svg || !view?.width || !view.height) return;
-  const base = svg.dataset.maBaseView?.split(" ").map(Number);
-  if (!base || base.length !== 4) return;
-  const level = base[2] / view.width;
-  const target = Math.min(Math.max(level * factor, ZOOM_LIMIT.min), ZOOM_LIMIT.max);
-  if (target === level) return;
-  const scale = level / target;
-  const width = view.width * scale,
-    height = view.height * scale;
-  // Anchor on the centre so repeated taps zoom into what is being looked at.
-  svg.setAttribute(
-    "viewBox",
-    `${view.x + (view.width - width) / 2} ${view.y + (view.height - height) / 2} ${width} ${height}`,
+
+/** Zoom through the animator's own PanZoom handler.
+ *
+ *  Writing the SVG viewBox directly looks equivalent but desynchronises the
+ *  package: PanZoomHandler seeds a private `viewBox` field once at construction
+ *  and never re-reads the DOM, so its pan handler would resume from the
+ *  pre-zoom framing and overwrite the attribute on the first drag — the zoom
+ *  visibly snapped back. That instance is private, but the package's own
+ *  KeyboardHandler is wired to it and listens on the container, so "+"/"-"
+ *  reach zoomIn()/zoomOut() and keep cache and DOM in step. */
+function zoomStage(container: HTMLElement | null, direction: "in" | "out") {
+  if (!container) return;
+  container.dispatchEvent(
+    new KeyboardEvent("keydown", { key: direction === "in" ? "+" : "-", bubbles: false }),
   );
 }
 
@@ -269,7 +489,6 @@ function AnimatorStage({
   const renderChainRef = useRef<Promise<void>>(Promise.resolve());
   const renderGenerationRef = useRef(0);
   const ownerGenerationRef = useRef(0);
-  const [paused, setPaused] = useState(false);
   const [loading, setLoading] = useState(true);
   const [ratio, setRatio] = useState<number | null>(null);
 
@@ -279,7 +498,6 @@ function AnimatorStage({
     const generation = ++renderGenerationRef.current;
     let disposed = false;
     setLoading(true);
-    setPaused(false);
     onError(null);
     const create = async () => {
       const options = {
@@ -351,31 +569,16 @@ function AnimatorStage({
     };
   }, [code, dark, fill, onError, onRatio]);
 
-  const togglePlayback = () => {
-    const animator = animatorRef.current;
-    if (!animator) return;
-    if (animator.isPaused()) animator.resume();
-    else animator.pause();
-    setPaused(animator.isPaused());
-  };
-
   return (
     <div
       className="group/stage relative h-full w-full"
       // A tall diagram is capped to a screenful and so ends up narrower than the
       // column. The wrapper narrows with it, so the control row stays anchored
       // to the picture's own corner rather than floating out in the margin.
-      style={
-        fill || !ratio
-          ? undefined
-          : { maxWidth: `calc(min(32rem, 70vh) / ${ratio})`, marginInline: "auto" }
-      }
+      style={fill || !ratio ? undefined : { maxWidth: widthCap(ratio), marginInline: "auto" }}
     >
-      {/* One tray, bottom-right, in both the inline and fullscreen stages: the
-          controls keep one address instead of migrating between corners, and a
-          single grouped surface means nothing can land on top of anything else.
-          Playback and view are separate segments — pressing pause is a different
-          kind of act from framing the picture. */}
+      {/* Flow runs continuously and frames itself; zoom is the only thing left
+          worth reaching for, so it is all this tray carries. */}
       <div
         className={`pointer-events-none absolute inset-x-0 bottom-0 z-10 flex flex-wrap items-center justify-end gap-2 p-3 ${
           fill
@@ -384,25 +587,14 @@ function AnimatorStage({
         }`}
       >
         <Tray>
-          <TrayButton
-            onClick={togglePlayback}
-            label={paused ? "Play animation" : "Pause animation"}
-          >
-            {paused ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
-          </TrayButton>
-        </Tray>
-        <Tray>
-          <TrayButton onClick={() => zoomStage(containerRef.current, 1 / 1.25)} label="Zoom out">
+          <TrayButton onClick={() => zoomStage(containerRef.current, "out")} label="Zoom out">
             <Minus className="h-3.5 w-3.5" />
           </TrayButton>
-          <TrayButton onClick={() => zoomStage(containerRef.current, 1.25)} label="Zoom in">
+          <TrayButton onClick={() => zoomStage(containerRef.current, "in")} label="Zoom in">
             <Plus className="h-3.5 w-3.5" />
           </TrayButton>
-          <TrayButton onClick={() => animatorRef.current?.fitToView()} label="Fit diagram">
-            <Home className="h-3.5 w-3.5" />
-          </TrayButton>
         </Tray>
-        {controls && <Tray>{controls}</Tray>}
+        {controls}
       </div>
       {loading && (
         <div className="absolute inset-0 z-1 flex items-center justify-center text-sm text-muted-foreground">
@@ -436,6 +628,135 @@ function AnimatorStage({
                 minHeight: "9rem",
               }
         }
+      />
+    </div>
+  );
+}
+
+/** Shared placeholder while a stage's chunk or render is in flight. */
+function StageSpinner({ label }: { label: string }) {
+  return (
+    <div className="flex min-h-40 items-center justify-center text-sm text-muted-foreground">
+      <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> {label}
+    </div>
+  );
+}
+
+/**
+ * Plain Mermaid, no motion.
+ *
+ * Worth having as its own mode rather than "explainer, paused": some diagrams
+ * (a pie chart, a gantt, an ER diagram) aren't a walk through anything, and a
+ * reader skimming a long document may simply not want things moving. It shares
+ * the sizing behaviour of the animated stages so switching modes doesn't make
+ * the surrounding text jump.
+ */
+function StaticStage({
+  code,
+  dark,
+  colored,
+  fill,
+  controls,
+  onError,
+  onRatio,
+}: {
+  code: string;
+  dark: boolean;
+  /** Colour nodes and edges by meaning; see lib/explainer/semantics.ts. */
+  colored?: boolean;
+  fill?: boolean;
+  controls?: React.ReactNode;
+  onError: (message: string | null) => void;
+  onRatio?: (ratio: number) => void;
+}) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const [loading, setLoading] = useState(true);
+  const [ratio, setRatio] = useState<number | null>(null);
+  const [size, setSize] = useState<DiagramSize | null>(null);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    let disposed = false;
+    setLoading(true);
+    onError(null);
+    // Declared out here so the failure path can clean up after the same id.
+    const id = `static-${Math.random().toString(36).slice(2, 10)}`;
+    const run = async () => {
+      try {
+        const { default: mermaid } = await import("mermaid");
+        mermaid.initialize({
+          startOnLoad: false,
+          theme: dark ? "dark" : "default",
+          securityLevel: "loose",
+          fontFamily: "ui-sans-serif, system-ui, sans-serif",
+        });
+        const { svg } = await mermaid.render(id, code);
+        if (disposed) return;
+        host.innerHTML = svg;
+        const svgEl = host.querySelector("svg");
+        if (svgEl) {
+          // Mermaid pins max-width to the intrinsic width, which stops the
+          // diagram growing to fill the stage the way the animated modes do.
+          svgEl.setAttribute("preserveAspectRatio", "xMidYMid meet");
+          if (colored) applySemantics(svgEl as SVGSVGElement);
+          svgEl.style.maxWidth = "100%";
+          svgEl.style.width = "100%";
+          svgEl.style.height = "100%";
+          const view = svgEl.viewBox.baseVal;
+          if (view?.width && view.height) {
+            // Clamped for the same reason the animated stages clamp: a tall
+            // diagram measured raw builds a box taller than the screen, which
+            // maxHeight then crushes into a sliver.
+            const measured = clampStageRatio(view.height / view.width);
+            setRatio(measured);
+            setSize({ width: view.width, height: view.height });
+            onRatio?.(measured);
+          }
+        }
+        setLoading(false);
+      } catch (error) {
+        clearRenderArtifacts(id);
+        if (disposed) return;
+        setLoading(false);
+        onError(describeRenderError(error));
+      }
+    };
+    void run();
+    return () => {
+      disposed = true;
+      host.innerHTML = "";
+    };
+  }, [code, dark, colored, onError, onRatio]);
+
+  return (
+    <div
+      className="group/stage relative h-full w-full"
+      style={fill || !ratio ? undefined : { maxWidth: widthCap(ratio), marginInline: "auto" }}
+    >
+      <div
+        className={`pointer-events-none absolute inset-x-0 bottom-0 z-10 flex flex-wrap items-center justify-end gap-2 p-3 ${
+          fill
+            ? ""
+            : "opacity-0 transition-opacity duration-150 group-hover/stage:opacity-100 group-focus-within/stage:opacity-100 [@media(hover:none)]:opacity-100"
+        }`}
+      >
+        {/* Passed already grouped: the caller decides what shares a surface,
+            because only it knows which controls belong to the live mode. */}
+        {controls}
+      </div>
+      {loading && (
+        <div className="absolute inset-0 z-1 flex items-center justify-center text-sm text-muted-foreground">
+          <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> Rendering diagram…
+        </div>
+      )}
+      <div
+        ref={hostRef}
+        data-tall={!fill && ratio && isTallStage(ratio) ? "" : undefined}
+        className={`${fill ? "h-full min-h-0 w-full" : "w-full box-content"}${
+          colored ? " diagram-colored" : ""
+        }`}
+        style={fill ? undefined : stageBoxStyle(ratio ?? 0.42, TRAY_GUTTER, size ?? undefined)}
       />
     </div>
   );

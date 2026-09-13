@@ -22,6 +22,8 @@ import {
   Pencil,
   Network,
   ListTree,
+  Code2,
+  Eye,
 } from "lucide-react";
 import type { MdFile } from "@/lib/markdown-utils";
 import {
@@ -106,6 +108,7 @@ function DocumentViewerImpl(props: Props) {
   if (kind === "json") return <JsonViewer {...props} />;
   if (kind === "mermaid") return <MermaidFileViewer {...props} />;
   if (kind === "board") return <BoardFileViewer {...props} />;
+  if (kind === "html") return <HtmlFileViewer {...props} />;
   if (kind === "presentation") return <PresentationViewer {...props} />;
   if (kind === "image") return <ImageViewer {...props} />;
   if (kind === "google-doc" || kind === "google-slide")
@@ -255,6 +258,85 @@ function BoardFileViewer({
   );
 }
 
+/**
+ * A standalone `.html` / `.htm` document, rendered rather than described.
+ *
+ * The page runs in a fully sandboxed frame — `sandbox=""`, matching
+ * `InlineArtifact` — which is the whole security story here. An uploaded HTML
+ * file is untrusted input: granting `allow-same-origin` would put it in the
+ * app's own origin, where its scripts could read the entire IndexedDB
+ * workspace. An empty sandbox blocks scripts, forms, popups and same-origin
+ * access, so the preview shows layout and styling while the document stays
+ * inert. `srcDoc` keeps it local — nothing is uploaded to render it.
+ *
+ * The source toggle is offered because a blocked-script page can look
+ * misleadingly empty; seeing the markup explains why.
+ */
+function HtmlFileViewer({
+  file,
+  isBookmarked,
+  onToggleBookmark,
+  prevFile,
+  nextFile,
+  onNavFile,
+  onOpenPalette,
+}: Props) {
+  // Preview first: rendering the page is the point of opening it. Source is a
+  // deliberate step away from that, the way it is in a browser.
+  const [showSource, setShowSource] = useState(false);
+
+  // A new document starts in preview rather than inheriting the previous file's
+  // mode — the toggle describes how you are reading *this* page.
+  useEffect(() => setShowSource(false), [file.id]);
+
+  useNavEscape(showSource, () => setShowSource(false), ESCAPE_DEPTH.mode);
+
+  return (
+    <ViewerFrame
+      file={file}
+      isBookmarked={isBookmarked}
+      onToggleBookmark={onToggleBookmark}
+      prevFile={prevFile}
+      nextFile={nextFile}
+      onNavFile={onNavFile}
+      onOpenPalette={onOpenPalette}
+      action={
+        <button
+          type="button"
+          onClick={() => setShowSource((on) => !on)}
+          className="inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          aria-pressed={showSource}
+        >
+          {showSource ? (
+            <>
+              <Eye className="h-3.5 w-3.5" /> Preview
+            </>
+          ) : (
+            <>
+              <Code2 className="h-3.5 w-3.5" /> Source
+            </>
+          )}
+        </button>
+      }
+    >
+      {showSource ? (
+        <div className="mx-auto max-w-5xl px-4 py-6 md:px-8">
+          <pre className="overflow-x-auto rounded-xl border border-border bg-muted/30 p-4 text-xs leading-relaxed">
+            <code>{file.content}</code>
+          </pre>
+        </div>
+      ) : (
+        <iframe
+          title={file.name}
+          srcDoc={file.content}
+          sandbox=""
+          className="h-[calc(100dvh-7.5rem)] w-full border-0 bg-white"
+        />
+      )}
+    </ViewerFrame>
+  );
+}
+
 function ViewerFrame({
   children,
   action,
@@ -360,7 +442,15 @@ function DocxViewer({
         } & MammothBrowser;
         const mammoth = module.default ?? module;
         const result = await mammoth.convertToHtml({ arrayBuffer: buffer });
-        if (alive) setHtml(result.value);
+        // mammoth's output is HTML derived from an untrusted file, and it goes
+        // straight into `dangerouslySetInnerHTML` below. mammoth does not
+        // promise a safe subset — a crafted .docx can carry through markup that
+        // executes — so the string is sanitized before it is ever mounted.
+        // Dropped in its own chunk alongside mammoth, so readers who never open
+        // a Word file pay nothing for it.
+        const { default: DOMPurify } = await import("dompurify");
+        const safe = DOMPurify.sanitize(result.value);
+        if (alive) setHtml(safe);
       } catch {
         if (alive) setError("This Word document could not be read in the browser.");
       }

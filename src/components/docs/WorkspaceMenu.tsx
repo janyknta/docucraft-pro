@@ -1,15 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import {
-  ChevronDown,
-  PlusCircle,
-  Download,
-  Upload,
-  Check,
-  FolderOpen,
-  Users,
-  Settings,
-} from "lucide-react";
+import { ChevronDown, PlusCircle, Check, FolderOpen, Settings } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
 interface WorkspaceLite {
@@ -20,31 +11,24 @@ interface WorkspaceLite {
 interface Props {
   workspaces: WorkspaceLite[];
   currentId: string | null;
-  onSwitch: (id: string) => void;
   onNew: (name: string) => void;
   onDelete: (id: string) => void;
-  onImport: (file: File) => void;
-  onExport: () => void;
-  onShare: () => void;
   /**
    * "pill" = compact header trigger; "sidebar" = full-width name;
    * "icon" = the monogram alone, for the collapsed rail where there is no room
    * for a label but the same menu still has to be reachable.
    */
   variant?: "pill" | "sidebar" | "icon";
-  /** Callback to open settings (typically rendered in sidebar) */
-  onSettings?: () => void;
+  /** Callback to open settings (typically rendered in sidebar). An optional tab
+   *  id lands the dialog straight on that section. */
+  onSettings?: (tab?: "workspace") => void;
 }
 
 export function WorkspaceMenu({
   workspaces,
   currentId,
-  onSwitch,
   onNew,
   onDelete,
-  onImport,
-  onExport,
-  onShare,
   onSettings,
   variant = "pill",
 }: Props) {
@@ -53,7 +37,6 @@ export function WorkspaceMenu({
   const [newName, setNewName] = useState("");
   const rootRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
   const sidebar = variant === "sidebar";
   const icon = variant === "icon";
   // Both rail variants anchor the same way: the trigger sits at the bottom of a
@@ -258,57 +241,29 @@ export function WorkspaceMenu({
                 </div>
               )}
 
-              {/* Switching: the other workspaces, when there are any. */}
-              {workspaces.length > 1 && (
+              {/* Switching lives in Settings, not here. The menu listed every
+                  workspace inline, which grew without bound and buried the
+                  actions below it; one row into the workspace settings keeps
+                  this menu a fixed height however many workspaces exist. */}
+              {onSettings && (
                 <>
                   <div className="my-1.5 h-px bg-border" />
-                  <div className="flex flex-col">
-                    {workspaces
-                      .filter((w) => w.id !== currentId)
-                      .map((w) => (
-                        <MenuRow
-                          key={w.id}
-                          icon={FolderOpen}
-                          label={w.name}
-                          onClick={() => {
-                            onSwitch(w.id);
-                            setOpen(false);
-                          }}
-                        />
-                      ))}
-                  </div>
+                  <MenuRow
+                    icon={FolderOpen}
+                    label="All workspaces"
+                    onClick={() => {
+                      onSettings("workspace");
+                      setOpen(false);
+                    }}
+                  />
                 </>
               )}
 
               <div className="my-1.5 h-px bg-border" />
 
-              {/* What you do to this workspace, then what you do to the app. */}
-              <div className="flex flex-col">
-                <MenuRow
-                  icon={Upload}
-                  label="Import workspace"
-                  onClick={() => fileRef.current?.click()}
-                />
-                <MenuRow
-                  icon={Download}
-                  label="Export workspace"
-                  onClick={() => {
-                    onExport();
-                    setOpen(false);
-                  }}
-                />
-                <MenuRow
-                  icon={Users}
-                  label="Share workspace"
-                  onClick={() => {
-                    onShare();
-                    setOpen(false);
-                  }}
-                />
-              </div>
-
-              <div className="my-1.5 h-px bg-border" />
-
+              {/* Import, export and share moved into workspace settings: they
+                  are things you do once in a while to a workspace, and having
+                  them here made a menu you open constantly three rows longer. */}
               <div className="flex flex-col">
                 {!creating && (
                   <MenuRow
@@ -365,21 +320,6 @@ export function WorkspaceMenu({
           </div>,
           document.body,
         )}
-
-      <input
-        ref={fileRef}
-        type="file"
-        accept="application/json,.json"
-        className="hidden"
-        onChange={(e) => {
-          const f = e.target.files?.[0];
-          if (f) {
-            onImport(f);
-            setOpen(false);
-          }
-          e.target.value = "";
-        }}
-      />
     </div>
   );
 }

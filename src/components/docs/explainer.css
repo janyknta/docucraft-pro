@@ -1,0 +1,144 @@
+/*
+ * Explainer mode.
+ *
+ * The diagram is Mermaid's, untouched: these rules only control *when* a piece
+ * of it is visible, never how it looks. Everything is scoped under
+ * `.explainer-stage`, so a diagram rendered in any other mode is unaffected —
+ * and a stage that never enters explainer mode never has `data-explainer` set,
+ * so none of this applies to it either.
+ */
+
+.explainer-stage {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.explainer-stage svg {
+  width: 100%;
+  height: 100%;
+  max-width: none !important; /* Mermaid pins this to the intrinsic width. */
+  max-height: 100%;
+  display: block;
+  /* The stage's proportions are clamped, so they rarely match the diagram's
+     exactly. `meet` framing (set on the element too) letterboxes the remainder
+     instead of stretching the picture or pushing it out of view. */
+  object-fit: contain;
+}
+
+/*
+ * A tall diagram is shown at its natural size and scrolled by the page, so the
+ * SVG must NOT be stretched to the stage. Filling a full-column box whose height
+ * came from a 20:1 ratio is what blew every node up to 349px; here the diagram
+ * keeps the size Mermaid gave it and simply sits in the middle of the column.
+ */
+.explainer-stage[data-tall] svg {
+  width: auto;
+  height: 100%;
+  margin-inline: auto;
+}
+
+/*
+ * The pre-roll state. Applied only once the player has taken control, so a
+ * diagram that fails to plan is never left invisible: without the attribute,
+ * every element keeps Mermaid's own visibility.
+ */
+.explainer-stage[data-explainer] .explainer-hidden {
+  opacity: 0;
+}
+
+/*
+ * Stepped drops Mermaid's flat theme fill, so the reader is not looking at a
+ * grid of identical filled boxes while one of them is being explained.
+ *
+ * A node the palette has classified keeps its tint, though — that fill is the
+ * signal, not noise, and stripping it made Stepped and Raw disagree about what
+ * the same diagram meant. Hence `:not([data-role])`.
+ */
+.explainer-stage[data-explainer] .node:not([data-role]) rect,
+.explainer-stage[data-explainer] .node:not([data-role]) polygon,
+.explainer-stage[data-explainer] .node:not([data-role]) circle,
+.explainer-stage[data-explainer] .node:not([data-role]) ellipse,
+.explainer-stage[data-explainer] .node:not([data-role]) path,
+.explainer-stage[data-explainer] .cluster rect {
+  fill: transparent !important;
+}
+
+/* Edge labels sit on a painted chip by default; on line art it reads as a
+   sticker. The text alone is enough. */
+.explainer-stage[data-explainer] .edgeLabel,
+.explainer-stage[data-explainer] .edgeLabel p,
+.explainer-stage[data-explainer] .labelBkg {
+  background: transparent !important;
+}
+
+/*
+ * Node reveal: a fade, and nothing else.
+ *
+ * No transform of any kind may be applied to a node group. Mermaid positions
+ * each one with a `transform="translate(x,y)"` *attribute*; a CSS `transform`
+ * replaces that attribute's effect, and `transform-box: view-box` (needed to
+ * scale about the node's own centre) re-anchors every node to the SVG viewport
+ * origin. Either way the whole diagram collapses into one pile of overlapping
+ * boxes with the arrows left stranded. A fade carries the sequence and cannot
+ * move anything.
+ */
+.explainer-stage[data-explainer] .explainer-node {
+  transition: opacity var(--explainer-reveal, 320ms) ease-out;
+}
+
+.explainer-stage[data-explainer] .explainer-node.explainer-shown {
+  opacity: 1;
+}
+
+/*
+ * A node arrived at a second time (a join, or a cycle closing) can't be
+ * revealed again, so it acknowledges the arrow with one brief dip in opacity —
+ * the only emphasis available that doesn't move the node.
+ */
+@keyframes explainer-pulse {
+  0% {
+    opacity: 1;
+  }
+  45% {
+    opacity: 0.55;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+.explainer-stage[data-explainer] .explainer-node.explainer-pulse {
+  animation: explainer-pulse 420ms ease-in-out;
+}
+
+/* Edge labels ride with their edge rather than appearing before it. */
+.explainer-stage[data-explainer] .explainer-label {
+  transition: opacity 200ms ease-out;
+}
+
+/*
+ * Edge drawing is driven frame-by-frame from JS via stroke-dashoffset, so the
+ * path itself carries no transition — a CSS transition would fight the scrubber
+ * and make stepping backwards animate forwards.
+ */
+.explainer-stage[data-explainer] path.flowchart-link {
+  transition: none;
+}
+
+/* The camera. Panning the viewBox per-frame is smooth on its own; this is only
+   for the discrete jump back to the home framing on restart. */
+.explainer-stage[data-explainer-camera] svg {
+  transition: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /*
+   * Motion is the entire feature, so reduced-motion doesn't disable it — it
+   * drops the incidental emphasis and keeps the fades, which still carry the
+   * sequence.
+   */
+  .explainer-stage[data-explainer] .explainer-node.explainer-pulse {
+    animation: none;
+  }
+}

@@ -198,7 +198,8 @@ interface Props {
   onSortByName?: () => void;
   view?: SidebarView;
   onView?: (view: SidebarView) => void;
-  onOpenSettings: () => void;
+  /** Opens settings. An optional tab id lands the dialog on that section. */
+  onOpenSettings: (tab?: "workspace") => void;
   /** Open the Ask AI panel. When omitted, the Ask AI button is hidden. */
   onAskAi?: () => void;
   onNewWorkspace?: (name?: string) => void;
@@ -499,7 +500,7 @@ function SidebarImpl({
     const KindIcon = kindIcon(kind);
     const mins = readingMinutes(file.content);
     const title = file.name.replace(
-      /\.(md|markdown|mdx|mmd|mermaid|excalidraw|txt|docx|pdf|xlsx|xls|csv|json|ppt|pptx|gdoc|gslides)$/i,
+      /\.(md|markdown|mdx|mmd|mermaid|excalidraw|txt|docx|pdf|xlsx|xls|csv|json|html|htm|ppt|pptx|gdoc|gslides)$/i,
       "",
     );
     const dragActive = reordering && !viewActive && realIndex >= 0 && !selecting;
@@ -982,12 +983,8 @@ function SidebarImpl({
             variant="sidebar"
             workspaces={workspaces}
             currentId={currentWorkspaceId ?? null}
-            onSwitch={onSwitchWorkspace}
             onNew={(name) => onNewWorkspace?.(name)}
             onDelete={(id) => onDeleteWorkspace?.(id)}
-            onImport={(file) => onImportWorkspace?.(file)}
-            onExport={() => onExportWorkspace?.()}
-            onShare={() => onShareWorkspace?.()}
             onSettings={onOpenSettings}
           />
         )}

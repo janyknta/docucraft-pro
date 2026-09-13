@@ -41,6 +41,11 @@ const CommandPalette = lazy(() =>
 const SettingsPage = lazy(() =>
   import("./SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
+
+/** The settings section a caller asked for, handed over the route change that
+ *  opens the dialog. DocsApp is the route component, so it remounts on the way
+ *  to /settings and nothing held inside it survives to be read at mount. */
+let pendingSettingsTab: "workspace" | undefined;
 const HighlightsOnlyModal = lazy(() =>
   import("./HighlightsOnlyModal").then((m) => ({ default: m.HighlightsOnlyModal })),
 );
@@ -54,10 +59,16 @@ import { fileSubtopics, readingMinutes } from "@/lib/markdown-utils";
 import { getDocumentKind, importDocumentFile, SUPPORTED_ACCEPT } from "@/lib/document-utils";
 import { clearArtifactResolutionCache } from "@/lib/workspace-artifacts";
 import { loadReadingFont, warmAppFonts } from "@/lib/fonts";
+import { restoreCustomFont } from "@/lib/custom-font";
 import { warmMarkdownPlugins } from "@/lib/markdown-plugins";
 import { toast } from "sonner";
 import { useHistory } from "@/hooks/use-history";
-import { isEditableTarget, hasModKey } from "@/lib/keyboard";
+import {
+  isEditableTarget,
+  hasModKey,
+  requestIdleCallbackSafe,
+  cancelIdleCallbackSafe,
+} from "@/lib/keyboard";
 import {
   persistence,
   loadPrefs,
@@ -249,6 +260,8 @@ export function DocsApp() {
   const [theme, setTheme] = useState<Theme>(() => loadPrefs().theme);
   const [readingMode, setReadingMode] = useState<ReadingMode>(() => loadPrefs().readingMode);
   const [readingFont, setReadingFont] = useState<ReadingFont>(() => loadPrefs().readingFont);
+  const [diagramColors, setDiagramColors] = useState<boolean>(() => loadPrefs().diagramColors);
+  const [aiEnabled, setAiEnabled] = useState<boolean>(() => loadPrefs().aiEnabled);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [highlightQuery, setHighlightQuery] = useState<string | null>(null);
@@ -456,24 +469,99 @@ export function DocsApp() {
     root.classList.toggle("dark", isDarkTheme(theme));
   }, [theme]);
 
-  // Reading typeface is keyed by `data-font`; "system" uses the base vars.
-  // The webfont itself is fetched here rather than bundled into the app's
-  // stylesheet — the attribute applies immediately against the system fallback
-  // and the real face swaps in when it lands.
+  // Reading typeface is keyed by `data-font`. The webfont itself is fetched
+  // here rather than bundled into the app's stylesheet — the attribute applies
+  // immediately against the system fallback and the real face swaps in when it
+  // lands.
   useEffect(() => {
-    const root = document.documentElement;
-    if (readingFont === "system") root.removeAttribute("data-font");
-    else root.setAttribute("data-font", readingFont);
+    document.documentElement.setAttribute("data-font", readingFont);
     loadReadingFont(readingFont);
   }, [readingFont]);
+
+  // Semantic diagram colouring rides the same channel: a diagram sits deep
+  // inside rendered markdown with no props reaching it, so it watches <html>.
+  // Written as "off" rather than removed, so the attribute's absence during
+  // first paint still means the default (on).
+  useEffect(() => {
+    document.documentElement.setAttribute("data-diagram-colors", diagramColors ? "on" : "off");
+    savePrefs({ diagramColors });
+  }, [diagramColors]);
+
+  // Turning AI off removes its surfaces rather than disabling them, so the
+  // attribute is published for CSS as well as read through props.
+  useEffect(() => {
+    document.documentElement.setAttribute("data-ai", aiEnabled ? "on" : "off");
+    savePrefs({ aiEnabled });
+  }, [aiEnabled]);
+
+  // A custom face lives in IndexedDB, so it has to be re-registered with the
+  // FontFace API on every boot before `[data-font="custom"]` can resolve it.
+  // If the file is gone (cleared storage, another device), fall back rather
+  // than leaving the reader on a family that no longer exists.
+  useEffect(() => {
+    let cancelled = false;
+    void restoreCustomFont().then((record) => {
+      if (cancelled || record) return;
+      setReadingFont((current) => (current === "custom" ? "hyperlegible" : current));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Inter backs the app chrome, and syntax highlighting / math typesetting back
   // most documents. All three are requested off the critical path: the first
   // paint runs on system fonts and unhighlighted code, and each upgrade lands
   // without the reader having waited on it.
+  //
+  // Held until after first contentful paint. `requestIdleCallback` alone was not
+  // late enough: the browser considers itself idle while it is still waiting on
+  // the boot chunks, so the warm wave (rehype-katex ~65 kB, rehype-highlight
+  // ~40 kB, the palette chunk and four Inter faces) opened its connections at
+  // ~378 ms and landed on top of FCP instead of after it — first-paint measured
+  // 156 ms but FCP 396 ms. Waiting for the paint entry moves that whole wave
+  // behind the reader's first frame, which is the only thing it was ever
+  // supposed to be behind.
   useEffect(() => {
-    warmAppFonts();
-    warmMarkdownPlugins();
+    let idle = 0;
+    const start = () => {
+      idle = requestIdleCallbackSafe(() => {
+        warmAppFonts();
+        warmMarkdownPlugins();
+      });
+    };
+
+    // No PerformanceObserver (or no paint timing) — fall back to the old
+    // behaviour rather than never warming at all.
+    if (typeof PerformanceObserver !== "function") {
+      start();
+      return () => cancelIdleCallbackSafe(idle);
+    }
+
+    // If FCP already happened before this effect ran, warm immediately.
+    const painted = performance
+      .getEntriesByType("paint")
+      .some((entry) => entry.name === "first-contentful-paint");
+    if (painted) {
+      start();
+      return () => cancelIdleCallbackSafe(idle);
+    }
+
+    const observer = new PerformanceObserver((list) => {
+      if (!list.getEntries().some((entry) => entry.name === "first-contentful-paint")) return;
+      observer.disconnect();
+      start();
+    });
+    try {
+      observer.observe({ type: "paint", buffered: true });
+    } catch {
+      start();
+    }
+
+    return () => {
+      observer.disconnect();
+      cancelIdleCallbackSafe(idle);
+    };
   }, []);
 
   useEffect(() => {
@@ -1933,15 +2021,28 @@ flowchart LR
   );
 
   const goHome = useCallback(() => navigate({ to: "/" }), [navigate]);
-  const openSettings = useCallback(() => {
-    navigate({ to: "/settings" });
-    navHistoryRef.current.push({ path: "/settings", fileId: null, headingId: null });
-  }, [navigate]);
+  // An optional tab lands the dialog straight on a section — "All workspaces"
+  // in the workspace menus opens it on workspace settings rather than making
+  // you find the tab yourself.
+  //
+  // Held outside the component: opening settings is a route change, and this
+  // component *is* the route, so it remounts on the way there and any state or
+  // ref holding the request is wiped before the dialog mounts to read it.
+  const openSettings = useCallback(
+    (tab?: "workspace") => {
+      pendingSettingsTab = tab;
+      navigate({ to: "/settings" });
+      navHistoryRef.current.push({ path: "/settings", fileId: null, headingId: null });
+    },
+    [navigate],
+  );
 
   // Closing the dialog is a route change back to the reader. Going through the
   // trail rather than straight to "/" keeps whatever document was open, and
   // means the close button, Escape, the backdrop and back all do one thing.
   const closeSettings = useCallback(() => {
+    // Spent: the next plain open starts where it always did.
+    pendingSettingsTab = undefined;
     if (navHistoryRef.current.canBack) navHistoryRef.current.back();
     else navigate({ to: "/" });
   }, [navigate]);
@@ -2077,10 +2178,13 @@ flowchart LR
   // Fetch the palette's chunk as soon as the app is idle. It is the most likely
   // of the split surfaces to be opened, and opening it is a keystroke away, so
   // it should already be in cache by the time that keystroke arrives.
+  //
+  // Scheduled off the shared idle helper so it queues behind the same work the
+  // other warm-ups do, and is cancelled on unmount rather than firing into a
+  // torn-down tree.
   useEffect(() => {
-    const warm = () => void import("./CommandPalette");
-    if (typeof requestIdleCallback === "function") requestIdleCallback(warm, { timeout: 4000 });
-    else setTimeout(warm, 1500);
+    const handle = requestIdleCallbackSafe(() => void import("./CommandPalette"), 4000);
+    return () => cancelIdleCallbackSafe(handle);
   }, []);
 
   // Append AI output to the open document, or spin it out into a new one.
@@ -2210,7 +2314,15 @@ flowchart LR
         onSetReadingMode={setReadingMode}
         readingFont={readingFont}
         onSetReadingFont={setReadingFont}
+        diagramColors={diagramColors}
+        onSetDiagramColors={setDiagramColors}
+        aiEnabled={aiEnabled}
+        onSetAiEnabled={setAiEnabled}
         onToggleArchiveFile={toggleArchiveFile}
+        onImportWorkspace={importWorkspace}
+        onExportWorkspace={exportWorkspace}
+        onShareWorkspace={shareWorkspace}
+        initialTab={pendingSettingsTab}
         onClose={closeSettings}
       />
     </Suspense>
@@ -2379,7 +2491,7 @@ flowchart LR
                 onRemoveHighlight={removeHighlight}
                 onShowHighlights={setHighlightsOnlyFileId}
                 onOpenSettings={openSettings}
-                onAskAi={openAskAi}
+                onAskAi={aiEnabled ? openAskAi : undefined}
                 onNewWorkspace={newWorkspace}
                 onImportWorkspace={importWorkspace}
                 onExportWorkspace={exportWorkspace}
@@ -2438,12 +2550,8 @@ flowchart LR
                 variant="icon"
                 workspaces={workspaces}
                 currentId={workspaceId}
-                onSwitch={switchWorkspace}
                 onNew={(name) => void newWorkspace(name)}
                 onDelete={(id) => void deleteWorkspace(id)}
-                onImport={(file) => void importWorkspace(file)}
-                onExport={exportWorkspace}
-                onShare={shareWorkspace}
                 onSettings={openSettings}
               />
             </div>
@@ -2517,14 +2625,18 @@ flowchart LR
                       setHighlightsOnlyFileId(id);
                       setDrawerOpen(false);
                     }}
-                    onOpenSettings={() => {
+                    onOpenSettings={(tab) => {
                       setDrawerOpen(false);
-                      openSettings();
+                      openSettings(tab);
                     }}
-                    onAskAi={() => {
-                      setDrawerOpen(false);
-                      openAskAi();
-                    }}
+                    onAskAi={
+                      aiEnabled
+                        ? () => {
+                            setDrawerOpen(false);
+                            openAskAi();
+                          }
+                        : undefined
+                    }
                     /* The workspace footer is what carries Settings, and with
                        it the workspace switcher. Without these the drawer —
                        the only navigation below `lg` — had no route to either. */
@@ -2577,7 +2689,7 @@ flowchart LR
                   onSavedShown={clearPendingSaved}
                   onHome={goHome}
                   onShareFile={shareActiveFile}
-                  onAskAi={askAiFromSelection}
+                  onAskAi={aiEnabled ? askAiFromSelection : undefined}
                   readingMode={readingMode}
                   workspaceId={workspaceId}
                   workspaceRevision={workspaceRevision}
@@ -2648,7 +2760,7 @@ flowchart LR
         {/* Mounted only once opened. The panel is a large component whose props
           are derived from every document in the workspace; keeping it out of
           the tree until it is asked for saves that work on every render. */}
-        {aiOpen && (
+        {aiOpen && aiEnabled && (
           <Suspense fallback={null}>
             <AskAiPanel
               open
@@ -2718,7 +2830,7 @@ function Header({
   onExportWorkspace?: () => void;
   onShareWorkspace?: () => void;
   onDeleteWorkspace?: (id: string) => void;
-  onOpenSettings?: () => void;
+  onOpenSettings?: (tab?: "workspace") => void;
 }) {
   return (
     <header
@@ -2796,12 +2908,9 @@ function Header({
               <WorkspaceMenu
                 workspaces={workspaces}
                 currentId={currentWorkspaceId ?? null}
-                onSwitch={onSwitchWorkspace}
                 onNew={(name) => onNewWorkspace?.(name)}
                 onDelete={(id) => onDeleteWorkspace?.(id)}
-                onImport={(file) => onImportWorkspace?.(file)}
-                onExport={() => onExportWorkspace?.()}
-                onShare={() => onShareWorkspace?.()}
+                onSettings={onOpenSettings}
               />
             </div>
             <div className="flex items-center gap-2 lg:hidden">
@@ -2811,16 +2920,14 @@ function Header({
                 onSwitch={onSwitchWorkspace}
                 onNew={(name) => onNewWorkspace?.(name)}
                 onDelete={(id) => onDeleteWorkspace?.(id)}
-                onImport={(file) => onImportWorkspace?.(file)}
-                onExport={() => onExportWorkspace?.()}
-                onShare={() => onShareWorkspace?.()}
+                onSettings={onOpenSettings}
               />
             </div>
           </>
         )}
         {onOpenSettings && (
           <button
-            onClick={onOpenSettings}
+            onClick={() => onOpenSettings()}
             className="inline-flex h-10 w-10 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
             aria-label="Settings"
             title="Settings"

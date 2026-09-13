@@ -17,7 +17,12 @@ import { createContext, useContext } from "react";
  */
 export interface SaveAction {
   saved: boolean;
-  toggle: (event: React.MouseEvent) => void;
+  /**
+   * Toggle the saved state. The event is optional: a button hands one over so
+   * the click can be stopped from reaching the block underneath, but a menu
+   * item has none to give.
+   */
+  toggle: (event?: React.MouseEvent) => void;
   /** Accessible name; reflects whether the block is currently saved. */
   label: string;
   /** Tooltip text. */

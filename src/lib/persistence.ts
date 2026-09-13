@@ -214,17 +214,28 @@ export function newWorkspaceRecord(name: string): WorkspaceRecord {
 
 // ---- lightweight preferences (localStorage) ----
 
-// Reader themes each carry a full, WCAG-checked token palette (see styles.css).
-// The old "light"/"dark" values remain valid so existing prefs keep working.
-export type ThemePref = "light" | "sepia" | "dark" | "nord" | "black";
+// One light and one dark palette, both WCAG-checked (see styles.css). The set
+// was five; sepia/nord/black were dropped so there is one obvious choice per
+// ambient light level rather than three near-identical dark variants.
+export type ThemePref = "light" | "dark";
 
 // Themes whose surfaces are dark — used to keep the legacy `.dark` class in sync
 // so dark-only rules (code highlighting, katex, mermaid) still apply.
-export const DARK_THEMES: readonly ThemePref[] = ["dark", "nord", "black"];
-export const READER_THEMES: readonly ThemePref[] = ["light", "sepia", "dark", "nord", "black"];
+export const DARK_THEMES: readonly ThemePref[] = ["dark"];
+export const READER_THEMES: readonly ThemePref[] = ["light", "dark"];
 
 export function isDarkTheme(theme: ThemePref): boolean {
   return DARK_THEMES.includes(theme);
+}
+
+/** Stored prefs predating the trim name themes that no longer exist. Map each
+ *  to whichever survivor matches its brightness, so an existing reader's screen
+ *  does not invert under them. */
+function migrateTheme(theme: unknown): ThemePref {
+  if (theme === "light" || theme === "dark") return theme;
+  if (theme === "sepia") return "light";
+  if (theme === "nord" || theme === "black") return "dark";
+  return DEFAULT_PREFS.theme;
 }
 
 // How a multi-section markdown document is laid out for reading.
@@ -232,19 +243,38 @@ export function isDarkTheme(theme: ThemePref): boolean {
 export type ReadingMode = "paginated" | "single";
 
 // Reading typeface. Each maps to a --font-body / --font-heading pair in styles.css.
-// "system" is the default — the device's own UI font (SF on macOS/iOS, Segoe on
-// Windows, Roboto on Android/Chrome OS).
-export type ReadingFont = "system" | "serif" | "newsreader" | "sans" | "hyperlegible";
-export const READING_FONTS: readonly ReadingFont[] = [
-  "system",
-  "serif",
-  "newsreader",
-  "sans",
-  "hyperlegible",
-];
+// One built-in face — Atkinson Hyperlegible, drawn for maximum letterform
+// distinction — plus whatever the reader uploads themselves. The other bundled
+// families were dropped: picking between five similar faces is not a decision
+// worth putting in front of someone who wants to read.
+export type ReadingFont = "hyperlegible" | "custom";
+export const READING_FONTS: readonly ReadingFont[] = ["hyperlegible", "custom"];
+
+/** Old prefs name faces that are no longer bundled. They all collapse onto the
+ *  one remaining built-in; "custom" only survives if a font is actually stored,
+ *  which the caller checks separately. */
+function migrateFont(font: unknown): ReadingFont {
+  return font === "custom" ? "custom" : "hyperlegible";
+}
 
 export interface Prefs {
   theme: ThemePref;
+  /**
+   * Colour diagram nodes by what they mean — green for success, red for
+   * failure, amber for a decision — rather than leaving every box the same
+   * neutral fill. Applies to Raw and Stepped; Flow keeps the animator's own
+   * palette, which already colours by packet.
+   */
+  diagramColors: boolean;
+  /**
+   * Whether the AI features exist at all.
+   *
+   * Off hides every AI surface — the Ask AI panel and its sidebar entry, the
+   * Ask AI row on the selection popover, the settings tab — rather than
+   * greying them out. A reader who does not want AI in their reader should not
+   * have to look at it.
+   */
+  aiEnabled: boolean;
   lastWorkspaceId: string | null;
   // The reader's name, asked once and remembered for personalized greetings.
   name: string | null;
@@ -258,18 +288,28 @@ export interface Prefs {
 const PREFS_KEY = "localdox:prefs";
 const DEFAULT_PREFS: Prefs = {
   theme: "dark",
+  diagramColors: true,
+  aiEnabled: true,
   lastWorkspaceId: null,
   name: null,
   namePrompted: false,
   readingMode: "paginated",
-  readingFont: "system",
+  readingFont: "hyperlegible",
 };
 
 export function loadPrefs(): Prefs {
   if (typeof localStorage === "undefined") return { ...DEFAULT_PREFS };
   try {
     const raw = localStorage.getItem(PREFS_KEY);
-    return raw ? { ...DEFAULT_PREFS, ...JSON.parse(raw) } : { ...DEFAULT_PREFS };
+    if (!raw) return { ...DEFAULT_PREFS };
+    const stored = { ...DEFAULT_PREFS, ...JSON.parse(raw) };
+    // Themes and faces were trimmed; a pref naming a removed one has to be
+    // mapped on read or it would set a `data-theme` no stylesheet answers.
+    return {
+      ...stored,
+      theme: migrateTheme(stored.theme),
+      readingFont: migrateFont(stored.readingFont),
+    };
   } catch {
     return { ...DEFAULT_PREFS };
   }
