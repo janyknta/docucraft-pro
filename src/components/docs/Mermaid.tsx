@@ -6,6 +6,7 @@ import { MermaidAnimator, type MermaidAnimator as MermaidAnimatorInstance } from
 import { useSaveAction } from "./save-action";
 import { applySemantics } from "@/lib/explainer/semantics";
 import { clearRenderArtifacts, describeRenderError } from "./render-error";
+import { largeDiagramMermaidConfig } from "./mermaid-config";
 import {
   MAX_STAGE_RATIO,
   MIN_STAGE_RATIO,
@@ -250,6 +251,7 @@ export function Mermaid({
         theme: dark ? "dark" : "light",
         width: 1200,
         height: 800,
+        mermaid: largeDiagramMermaidConfig(),
       });
       download(blob, `${baseName(name)}.webm`);
       toast.success("Downloaded animated Mermaid as WebM");
@@ -509,7 +511,7 @@ function AnimatorStage({
         inspect: true,
         minZoom: ZOOM_LIMIT.min,
         maxZoom: ZOOM_LIMIT.max,
-        mermaid: { securityLevel: "loose", fontFamily: "ui-sans-serif, system-ui, sans-serif" },
+        mermaid: largeDiagramMermaidConfig(),
       } as const;
       try {
         let animator: MermaidAnimatorInstance;
@@ -688,8 +690,7 @@ function StaticStage({
         mermaid.initialize({
           startOnLoad: false,
           theme: dark ? "dark" : "default",
-          securityLevel: "loose",
-          fontFamily: "ui-sans-serif, system-ui, sans-serif",
+          ...largeDiagramMermaidConfig(),
         });
         const { svg } = await mermaid.render(id, code);
         if (disposed) return;
