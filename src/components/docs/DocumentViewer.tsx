@@ -6,7 +6,6 @@ import { lazy, memo, Suspense, useEffect, useMemo, useRef, useState } from "reac
 import {
   ChevronLeft,
   ChevronRight,
-  Download,
   FileText,
   Filter,
   Maximize,
@@ -58,6 +57,8 @@ interface Props {
   onNavFile?: (fileId: string) => void;
   /** Rendered inside markdown content: strip all chrome, show only the content. */
   embedded?: boolean;
+  /** Fill a bounded parent (such as a split pane) instead of the viewport. */
+  fillAvailableHeight?: boolean;
   /** Persist an edited document. Omitted where the viewer is read-only. */
   onContentChange?: (fileId: string, content: string) => void;
   /** Opens the workspace command palette from the header's search field. */
@@ -202,59 +203,26 @@ function MermaidFileViewer({
  * A standalone `.excalidraw` board. The canvas is the editor — there is no
  * separate edit mode to enter, and no markdown editor is offered for it: a
  * board's source is an Excalidraw scene, and letting someone type into it by
- * hand would only corrupt the document. Download hands back the same
- * `.excalidraw` bytes, so a board drawn here opens on excalidraw.com unchanged.
+ * hand would only corrupt the document.
  */
-function BoardFileViewer({
-  file,
-  prevFile,
-  nextFile,
-  onNavFile,
-  onContentChange,
-  onOpenPalette,
-}: Props) {
-  const download = () => {
-    const blob = new Blob([file.content || "{}"], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = file.name.endsWith(".excalidraw")
-      ? file.name
-      : `${stripExt(file.name)}.excalidraw`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
+function BoardFileViewer({ file, onContentChange, fillAvailableHeight }: Props) {
   return (
-    <ViewerFrame
-      file={file}
-      prevFile={prevFile}
-      nextFile={nextFile}
-      onNavFile={onNavFile}
-      onOpenPalette={onOpenPalette}
-      action={
-        <button
-          type="button"
-          onClick={download}
-          className="inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-        >
-          <Download className="h-3.5 w-3.5" /> Download .excalidraw
-        </button>
-      }
+    <div
+      className={`min-h-0 min-w-0 overflow-hidden ${
+        fillAvailableHeight ? "h-full w-full" : "h-[calc(100dvh-3.5rem)] w-full lg:h-dvh"
+      }`}
     >
       {/* No padding, no card, no border: a board is a surface, not a figure on
           a page. Framing it the way a diagram is framed is exactly what made it
           read as an embedded iframe rather than part of the app. */}
-      <div className="h-[calc(100dvh-3.5rem)] w-full">
-        <BoardCanvas
-          fileId={file.id}
-          content={file.content}
-          onContentChange={
-            onContentChange ? (content) => onContentChange(file.id, content) : undefined
-          }
-        />
-      </div>
-    </ViewerFrame>
+      <BoardCanvas
+        fileId={file.id}
+        content={file.content}
+        onContentChange={
+          onContentChange ? (content) => onContentChange(file.id, content) : undefined
+        }
+      />
+    </div>
   );
 }
 

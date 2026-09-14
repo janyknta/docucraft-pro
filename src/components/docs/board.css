@@ -13,6 +13,14 @@
   background: var(--background);
 }
 
+/* Split panes can be narrower and shorter than the browser viewport. Keep the
+   editor inside that measured box so Excalidraw's own ResizeObserver sees the
+   real dimensions and switches to its compact controls when necessary. */
+.excalidraw-surface {
+  min-width: 0;
+  overflow: hidden;
+}
+
 /* The canvas keeps the scene's own background — only the surround follows the
    app theme, so a board exported from here looks the same everywhere. */
 .excalidraw-surface .excalidraw .excalidraw__canvas {

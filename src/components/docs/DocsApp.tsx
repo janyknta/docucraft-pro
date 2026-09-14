@@ -2930,6 +2930,10 @@ flowchart LR
                 <ResizablePanelGroup orientation="horizontal" className="h-full">
                   {paneLayout.panes.map((pane, index) => {
                     const paneFile = files.find((f) => f.id === pane.activeTabId) ?? null;
+                    const paneKind = paneFile
+                      ? (paneFile.kind ?? getDocumentKind(paneFile.name, paneFile.mimeType))
+                      : null;
+                    const paneIsBoard = paneKind === "board";
                     return (
                       <Fragment key={pane.id}>
                         {index > 0 && <ResizableHandle withHandle />}
@@ -2939,7 +2943,7 @@ flowchart LR
                         >
                           <div
                             onMouseDown={() => focusPane(pane.id)}
-                            className="flex h-full min-h-0 flex-col"
+                            className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden"
                           >
                             {/* No tab strip. The open documents live in the
                                 sidebar; a pane is just a column of reading, and
@@ -2965,7 +2969,13 @@ flowchart LR
                                 <X className="h-3.5 w-3.5" />
                               </button>
                             </div>
-                            <div className="min-h-0 flex-1 overflow-y-auto px-4">
+                            <div
+                              className={
+                                paneIsBoard
+                                  ? "min-h-0 min-w-0 flex-1 overflow-hidden"
+                                  : "min-h-0 min-w-0 flex-1 overflow-y-auto px-4"
+                              }
+                            >
                               {paneFile ? (
                                 <PaneDocument
                                   file={paneFile}
@@ -2984,6 +2994,8 @@ flowchart LR
                                   onRemoveSaved={removeSaved}
                                   onOpenArtifact={openEmbeddedArtifact}
                                   readingMode={readingMode}
+                                  startInEditFileId={autoEditFileId}
+                                  onStartInEditConsumed={consumeStartInEdit}
                                 />
                               ) : (
                                 <p className="px-2 py-16 text-center text-sm text-muted-foreground">

@@ -37,6 +37,7 @@ import {
   MoreHorizontal,
   Search,
   Crosshair,
+  Code2,
   Download,
   Expand,
   Minimize2,
@@ -73,7 +74,8 @@ import {
   type SavedDraft,
   type SavedItem,
 } from "@/lib/saved-items";
-import { locateInSource } from "@/lib/source-locate";
+import { locateInSource, sourceLinesForSelection } from "@/lib/source-locate";
+import { copyText } from "@/lib/share";
 import { fileSubtopics, headingChunkMap, readingMinutes, wordCount } from "@/lib/markdown-utils";
 import { InlineArtifact } from "./InlineArtifact";
 import { InteractiveBlock } from "./InteractiveBlock";
@@ -637,6 +639,20 @@ function MarkdownViewerImpl({
     setInspectMissed(!span);
     setEditMode(true);
     setPendingSelect(span ?? { start: Math.max(0, chunkStart), end: Math.max(0, chunkStart) });
+  };
+
+  const copySource = (text: string) => {
+    // Like Inspect, prefer the section currently on screen so repeated prose
+    // resolves to the source the reader actually highlighted.
+    const chunkStart = singleMode ? -1 : file.content.indexOf(activeChunk.content);
+    const prefer =
+      chunkStart >= 0 && !singleMode
+        ? { from: chunkStart, to: chunkStart + activeChunk.content.length }
+        : undefined;
+    const source = sourceLinesForSelection(file.content, text, prefer) ?? text;
+    void copyText(source);
+    window.getSelection()?.removeAllRanges();
+    setMenu(null);
   };
 
   // Applied once the editor has mounted with the document's source.
@@ -1401,13 +1417,22 @@ function MarkdownViewerImpl({
                 />
               </div>
 
-              <button
-                onClick={() => inspect(menu.mode === "create" ? menu.text : menu.hl.text)}
-                title="Open the editor with this text selected"
-                className="mb-2 flex w-full items-center justify-center gap-1.5 rounded-md border border-border px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
-              >
-                <Crosshair className="h-3.5 w-3.5" /> Inspect in source
-              </button>
+              <div className="mb-2 grid grid-cols-2 gap-1">
+                <button
+                  onClick={() => inspect(menu.mode === "create" ? menu.text : menu.hl.text)}
+                  title="Open the editor with this text selected"
+                  className="flex items-center justify-center gap-1.5 rounded-md border border-border px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+                >
+                  <Crosshair className="h-3.5 w-3.5" /> Inspect source
+                </button>
+                <button
+                  onClick={() => copySource(menu.mode === "create" ? menu.text : menu.hl.text)}
+                  title="Copy the source code behind this text"
+                  className="flex items-center justify-center gap-1.5 rounded-md border border-border px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+                >
+                  <Code2 className="h-3.5 w-3.5" /> Copy code
+                </button>
+              </div>
 
               <div className="flex items-center gap-1">
                 {/* Saving lives here rather than on a star pinned to every

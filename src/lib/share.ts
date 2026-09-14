@@ -100,15 +100,15 @@ export async function fetchShare(keyOrData: string): Promise<string> {
 }
 
 /** Clipboard write with a fallback for browsers/contexts without the async API. */
-export async function copyLink(url: string): Promise<void> {
+export async function copyText(text: string): Promise<void> {
   try {
-    await navigator.clipboard.writeText(url);
+    await navigator.clipboard.writeText(text);
     return;
   } catch {
     // Insecure context or a denied permission — fall through to the old trick.
   }
   const field = document.createElement("textarea");
-  field.value = url;
+  field.value = text;
   field.setAttribute("readonly", "");
   field.style.position = "fixed";
   field.style.opacity = "0";
@@ -119,6 +119,10 @@ export async function copyLink(url: string): Promise<void> {
   } finally {
     document.body.removeChild(field);
   }
+}
+
+export function copyLink(url: string): Promise<void> {
+  return copyText(url);
 }
 
 export function base64UrlEncode(buffer: ArrayBuffer): string {
