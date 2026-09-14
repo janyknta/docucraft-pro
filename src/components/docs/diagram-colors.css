@@ -144,6 +144,64 @@
 .diagram-colored [data-role="external"] .nodeLabel { color: var(--diagram-external) !important; }
 .diagram-colored [data-role="terminal"] .nodeLabel { color: var(--diagram-terminal) !important; }
 
+/*
+ * Nodes with no role of their own.
+ *
+ * Mermaid's dark theme fills these with #1f2020 — a warm near-black that lands
+ * on this app's blue-black surface as a muddy grey slab: measured 1.29:1
+ * against the frame, where the roled nodes sit at 1.09–1.14 and read as part of
+ * the picture. The label was never the problem (10:1); the box around it was.
+ *
+ * So a neutral node gets the same treatment every roled node gets — a faint
+ * tint and a visible outline, in the theme's own hue rather than Mermaid's. It
+ * is the *shape* that has to be legible; the text already was.
+ *
+ * Deliberately outside `.diagram-colored`: a reader who turned semantic colour
+ * off asked for one fewer colour system, not for unreadable boxes.
+ */
+:root {
+  --diagram-neutral: #52525b;
+  --diagram-neutral-tint: #52525b0f;
+}
+.dark {
+  /* Zinc-400. Bright enough to draw the outline clearly on the dark surface,
+     neutral enough that it never competes with a roled node beside it. */
+  --diagram-neutral: #a1a1aa;
+  --diagram-neutral-tint: #a1a1aa14;
+}
+
+.mermaid-frame g.node:not([data-role]) > rect,
+.mermaid-frame g.node:not([data-role]) > polygon,
+.mermaid-frame g.node:not([data-role]) > circle,
+.mermaid-frame g.node:not([data-role]) > ellipse,
+.mermaid-frame g.node:not([data-role]) > path {
+  fill: var(--diagram-neutral-tint) !important;
+  stroke: var(--diagram-neutral) !important;
+}
+
+/*
+ * A node the reader can recolour.
+ *
+ * Discovery is hover-only on purpose: a persistent affordance on every box
+ * would draw a second visual system across a diagram whose whole job is to be
+ * read, for an action almost nobody takes on almost any node. The cursor and a
+ * slight lift are enough to answer "can I click this?" for the reader who
+ * already suspects they can.
+ *
+ * Applied outside `.diagram-colored` too — correcting a colour is not something
+ * only readers with semantic colouring turned on should be able to do.
+ */
+[data-colorable] {
+  cursor: pointer;
+}
+[data-colorable]:hover rect,
+[data-colorable]:hover polygon,
+[data-colorable]:hover circle,
+[data-colorable]:hover ellipse,
+[data-colorable]:hover path {
+  filter: brightness(1.06);
+}
+
 /* Edges carry their own verdict — a "no" branch is red all the way along it,
    not only at the box it lands in. */
 .diagram-colored path[data-role="success"],

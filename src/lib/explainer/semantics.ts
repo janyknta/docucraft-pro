@@ -21,6 +21,8 @@
  * lives in CSS so both themes can answer it differently.
  */
 
+import { canDecorateDiagram } from "@/components/docs/mermaid-performance";
+
 export type SemanticRole =
   | "success"
   | "failure"
@@ -376,6 +378,12 @@ const COLORABLE_EDGES = [
  * Runs once after render; it never re-reads the DOM during playback.
  */
 export function applySemantics(svg: SVGSVGElement): void {
+  // Colouring walks every edge and every node, classifying each against several
+  // word lists. That is cheap per element and ruinous at ERD scale, where it is
+  // one of three full passes over tens of thousands of elements. Past the
+  // budget the diagram keeps Mermaid's own palette, which is a far better
+  // outcome than a frozen tab.
+  if (!canDecorateDiagram(svg)) return;
   // Edge labels are needed before nodes, so a neutral node can inherit the
   // verdict of the branch that reaches it.
   const incomingByNode = new Map<string, string[]>();
@@ -407,7 +415,15 @@ export function applySemantics(svg: SVGSVGElement): void {
     // recolouring half the pair is what breaks it.
     if (hasAuthorFill(node)) continue;
 
-    const label = node.textContent?.trim() ?? "";
+    // The node's own label, preferred over the group's whole text content.
+    //
+    // A colourable node carries an SVG <title> tooltip, which is real text: read
+    // the group and a re-tag over already-marked DOM would classify "Error:
+    // failed" as "Click to change this block's colourError: failed". Today the
+    // first render happens to tag before marking, so this is a trap rather than
+    // a live bug — but the ordering is incidental, and nothing should depend on
+    // it. `.nodeLabel` is what the reader actually sees.
+    const label = (node.querySelector(".nodeLabel") ?? node).textContent?.trim() ?? "";
     // Match the same key the graph reader derives, so edge hints line up.
     const key = node.id
       .replace(/-\d+$/, "")

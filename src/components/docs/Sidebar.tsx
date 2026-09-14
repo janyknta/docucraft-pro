@@ -1593,16 +1593,6 @@ export function AddMenu({
               }}
             />
           )}
-          {onCreateMermaid && (
-            <MenuItem
-              icon={Workflow}
-              label="New Mermaid animation"
-              onClick={() => {
-                setOpen(false);
-                onCreateMermaid();
-              }}
-            />
-          )}
           {onCreateBoard && (
             <MenuItem
               icon={PenTool}
@@ -1701,10 +1691,9 @@ function FolderMenu({
       {open && (
         <MenuPanel>
           {onNewFile && item("New File here", FilePlus, onNewFile)}
-          {onNewMermaid && item("New Mermaid here", Workflow, onNewMermaid)}
           {onNewBoard && item("New Board here", PenTool, onNewBoard)}
           {onNewFolder && item("New Folder", FolderPlus, onNewFolder)}
-          {(onNewFile || onNewMermaid || onNewBoard || onNewFolder) && (onRename || onDelete) && (
+          {(onNewFile || onNewBoard || onNewFolder) && (onRename || onDelete) && (
             <div className="my-1 h-px bg-border" />
           )}
           {onRename && item("Rename folder", Pencil, onRename)}

@@ -9,6 +9,9 @@ import {
 } from "react";
 import { Eye } from "lucide-react";
 import { caretTop } from "@/lib/source-locate";
+import type { FormatAction } from "@/lib/markdown-format";
+import { TOOLBAR_ITEMS } from "@/lib/markdown-toolbar-items";
+import { MarkdownToolbar } from "./MarkdownToolbar";
 
 /**
  * The markdown source editor.
@@ -117,6 +120,60 @@ function MarkdownEditorImpl(
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  /**
+   * Run a formatting action against the live selection.
+   *
+   * The new selection is written back in the same frame as the text, so the
+   * reader never sees the caret jump to the end and come back. `setSelectionRange`
+   * has to wait for React to commit the new value — setting it against the old
+   * text would place it by the wrong offsets.
+   */
+  const applyFormat = useCallback((action: FormatAction) => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const next = action({ text: ta.value, start: ta.selectionStart, end: ta.selectionEnd });
+    if (
+      next.text === ta.value &&
+      next.start === ta.selectionStart &&
+      next.end === ta.selectionEnd
+    ) {
+      return;
+    }
+    setDraft(next.text);
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus({ preventScroll: true });
+      el.setSelectionRange(next.start, next.end);
+    });
+  }, []);
+
+  // Formatting shortcuts. Bound on the textarea rather than the window: these
+  // are edits to *this* field, and a global binding would fire while the reader
+  // was typing in the search box or a rename input.
+  const onShortcut = useCallback(
+    (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (!(event.metaKey || event.ctrlKey)) return;
+      const key = event.key.toLowerCase();
+      for (const item of TOOLBAR_ITEMS) {
+        if (!item.shortcut) continue;
+        const parts = item.shortcut.split("+");
+        if (parts.includes("Shift") !== event.shiftKey) continue;
+        if (parts.includes("Alt") !== event.altKey) continue;
+        // The last segment is the key itself. Compared case-insensitively, and
+        // against `event.code` digits too: Alt on macOS rewrites `key` into a
+        // symbol (⌥1 becomes "¡"), which would otherwise never match.
+        const wanted = parts[parts.length - 1].toLowerCase();
+        const matches = key === wanted || (/^\d$/.test(wanted) && event.code === `Digit${wanted}`);
+        if (!matches) continue;
+        event.preventDefault();
+        applyFormat(item.action);
+        return;
+      }
+    },
+    [applyFormat],
+  );
+
   const cancel = useCallback(() => {
     // Order matters: the flag has to be set before the parent unmounts this
     // component, or the cleanup above would re-save the discarded draft.
@@ -155,13 +212,30 @@ function MarkdownEditorImpl(
           section instead.
         </div>
       )}
-      <textarea
-        ref={textareaRef}
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        spellCheck={false}
-        className="min-h-[70vh] w-full resize-y rounded-lg border border-border bg-muted/30 p-4 font-mono text-sm leading-relaxed outline-none focus:border-primary/50"
-      />
+      {/* Toolbar and field are one surface: the buttons act on the text
+          directly below them, and a gap between the two would read as chrome
+          belonging to the page rather than to this field.
+
+          The toolbar is a plain header pinned to the top of that surface, not a
+          sticky element. It was sticky once, which was wrong twice over: the
+          offset had to guess the exit bar's height, and `position: sticky` does
+          nothing useful inside this `overflow-hidden` box, which is not itself
+          a scroll container — the row simply parked partway down the field. The
+          editor scrolls as part of the page, so the header travels with it. */}
+      <div className="overflow-hidden rounded-lg border border-border bg-muted/30 focus-within:border-primary/50">
+        <div className="border-b border-border bg-background/90">
+          <MarkdownToolbar onAction={applyFormat} />
+        </div>
+        <textarea
+          id="markdown-source"
+          ref={textareaRef}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={onShortcut}
+          spellCheck={false}
+          className="min-h-[70vh] w-full resize-y bg-transparent p-4 font-mono text-sm leading-relaxed outline-none"
+        />
+      </div>
     </div>
   );
 }

@@ -4,9 +4,22 @@ import { Download, Expand, LoaderCircle, Minus, Plus, Star, X } from "lucide-rea
 import { toast } from "sonner";
 import type { MermaidAnimator as MermaidAnimatorInstance } from "mermaid-animator";
 import { useSaveAction } from "./save-action";
-import { clearRenderArtifacts, describeRenderError } from "./render-error";
+import { describeRenderError } from "./render-error";
 import { largeDiagramMermaidConfig } from "./mermaid-config";
+import { renderMermaid } from "./mermaid-render-cache";
+import { DiagramNodeColorPopover } from "./DiagramNodeColorPopover";
 import {
+  COLORABLE_NODES,
+  applyOne,
+  applyOverrides,
+  diagramKey,
+  loadOverrides,
+  nodeKey,
+  saveOverride,
+  type NodeOverrides,
+} from "@/lib/diagram-node-colors";
+import {
+  isRenderedDiagramTooLarge,
   optimizeSvgForImageRendering,
   readSvgViewBox,
   shouldUseDiagramPerformanceMode,
@@ -198,7 +211,17 @@ export function Mermaid({
   // Trimming a multi-megabyte source on every state update is measurable. The
   // prop changes only when the document changes, so retain the normalized view.
   const source = useMemo(() => code.trim(), [code]);
-  const performanceMode = useMemo(() => shouldUseDiagramPerformanceMode(source), [source]);
+  const sourceTooLarge = useMemo(() => shouldUseDiagramPerformanceMode(source), [source]);
+  /**
+   * Set when the rendered SVG turned out to be too large even though the
+   * source scan cleared it. Held separately from the source verdict so the two
+   * stages of the gate stay legible, and combined below.
+   */
+  const [renderTooLarge, setRenderTooLarge] = useState(false);
+  const handleOversized = useCallback(() => setRenderTooLarge(true), []);
+  // A new diagram deserves a fresh verdict; the old one's may not apply.
+  useEffect(() => setRenderTooLarge(false), [source]);
+  const performanceMode = sourceTooLarge || renderTooLarge;
   const [performanceImageUrl, setPerformanceImageUrl] = useState<string | null>(null);
   const handlePerformanceImage = useCallback((url: string | null) => {
     setPerformanceImageUrl(url);
@@ -386,6 +409,7 @@ export function Mermaid({
           onRatio={stageFill ? undefined : setStageRatio}
           performanceMode={performanceMode}
           onPerformanceImage={handlePerformanceImage}
+          onOversized={handleOversized}
         />
       );
     }
@@ -414,7 +438,20 @@ export function Mermaid({
         data-performance-mode={performanceMode ? "" : undefined}
       >
         {header}
-        {renderError ? <MermaidError error={renderError} /> : stageFor(false)}
+        {/* While fullscreen is open the inline stage is torn down rather than
+            left mounted behind the overlay. Both copies are live SVG, so
+            keeping this one costs a second full style and layout pass over a
+            diagram nobody can currently see — on a large ERD that is the
+            difference between a smooth overlay and a locked tab. The frame
+            keeps its measured height, so closing fullscreen does not make the
+            surrounding text jump. */}
+        {renderError ? (
+          <MermaidError error={renderError} />
+        ) : fullscreen ? (
+          <div style={frameCap ? { aspectRatio: `1 / ${stageRatio ?? 0.42}` } : undefined} />
+        ) : (
+          stageFor(false)
+        )}
       </div>
 
       {fullscreen &&
@@ -578,7 +615,6 @@ function AnimatorStage({
           setRatio(measured);
           onRatio?.(measured);
         }
-        if (fill) requestAnimationFrame(() => animator.fitToView());
         setLoading(false);
       } catch (error) {
         if (!disposed) {
@@ -604,7 +640,20 @@ function AnimatorStage({
         ownerGenerationRef.current = 0;
       }
     };
-  }, [code, dark, fill, onError, onRatio]);
+    // `fill` is deliberately absent: it changes how the diagram is *framed*,
+    // not what it contains, and listing it here made opening fullscreen
+    // destroy the animator and lay the whole diagram out again — twice per
+    // toggle, since closing did it too. Framing is applied by the effect below
+    // instead, against the instance that is already running.
+  }, [code, dark, onError, onRatio]);
+
+  // Re-frame an existing animator when the stage changes shape. Cheap: it
+  // writes a viewBox, where a re-create would re-run Mermaid's layout.
+  useEffect(() => {
+    if (!fill || loading) return;
+    const frame = requestAnimationFrame(() => animatorRef.current?.fitToView());
+    return () => cancelAnimationFrame(frame);
+  }, [fill, loading]);
 
   return (
     <div
@@ -670,6 +719,32 @@ function AnimatorStage({
   );
 }
 
+/**
+ * Mark every node a reader can recolour.
+ *
+ * The attribute is what `diagram-colors.css` hangs the hover affordance on, and
+ * the tooltip is the only discovery this feature gets — nothing about a
+ * rendered box says "clickable" on its own.
+ */
+function markColorableNodes(svg: SVGSVGElement): void {
+  for (const node of svg.querySelectorAll<SVGElement>(COLORABLE_NODES)) {
+    node.setAttribute("data-colorable", "");
+    // The tooltip goes on the *shape*, never on the node group.
+    //
+    // An SVG <title> is real text content: appended to the group, it joined the
+    // node's own label, so `node.textContent` came back as "Ordinary stepClick
+    // to change…". That is not cosmetic — semantics.ts classifies a node by
+    // matching keywords against exactly that string, and the colour picker
+    // shows it back to the reader as the node's name.
+    const shape = node.querySelector("rect, polygon, circle, ellipse, path");
+    if (shape && !shape.querySelector("title")) {
+      const tip = document.createElementNS("http://www.w3.org/2000/svg", "title");
+      tip.textContent = "Click to change this block's colour";
+      shape.appendChild(tip);
+    }
+  }
+}
+
 /** Shared placeholder while a stage's chunk or render is in flight. */
 function StageSpinner({ label }: { label: string }) {
   return (
@@ -698,6 +773,7 @@ function StaticStage({
   onRatio,
   performanceMode,
   onPerformanceImage,
+  onOversized,
 }: {
   code: string;
   dark: boolean;
@@ -709,6 +785,12 @@ function StaticStage({
   onRatio?: (ratio: number) => void;
   performanceMode?: boolean;
   onPerformanceImage?: (url: string | null) => void;
+  /**
+   * Fired when the *rendered* diagram turns out to be too large for live DOM,
+   * even though the source scan let it through. The caller uses this to drop
+   * the animated modes, exactly as it would for a source-flagged diagram.
+   */
+  onOversized?: () => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(true);
@@ -716,6 +798,78 @@ function StaticStage({
   const [size, setSize] = useState<DiagramSize | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const imageUrlRef = useRef<string | null>(null);
+  /**
+   * Whether this render is being shown as a flattened image.
+   *
+   * Distinct from the `performanceMode` prop: that is the source-scan verdict,
+   * known before rendering, while this also covers a diagram that only
+   * revealed its size once Mermaid had laid it out.
+   */
+  const [asImage, setAsImage] = useState(Boolean(performanceMode));
+
+  /**
+   * The reader's own colours for this diagram's nodes.
+   *
+   * Held in a ref as well as state: the render effect re-applies them to each
+   * fresh SVG, and reading them from state there would mean listing them as a
+   * dependency and re-rendering the whole diagram every time one box changed.
+   */
+  const diagram = useMemo(() => diagramKey(code), [code]);
+  const [overrides, setOverrides] = useState<NodeOverrides>(() => loadOverrides(diagram));
+  const overridesRef = useRef(overrides);
+  overridesRef.current = overrides;
+  // A different diagram has different overrides; the previous one's must not
+  // leak onto it.
+  useEffect(() => {
+    const next = loadOverrides(diagram);
+    overridesRef.current = next;
+    setOverrides(next);
+  }, [diagram]);
+
+  /** The node whose colour is being picked, if any. */
+  const [picker, setPicker] = useState<{ node: string; label: string; rect: DOMRect } | null>(null);
+  // A re-render moves every node, so a picker still pointing at the old
+  // rectangle would float away from its box.
+  useEffect(() => setPicker(null), [code, dark, colored]);
+
+  const pickColor = useCallback(
+    (color: string | null) => {
+      if (!picker) return;
+      const svgEl = hostRef.current?.querySelector("svg");
+      if (svgEl) {
+        // Repaint immediately rather than waiting on a re-render that is not
+        // coming: the SVG is imperative, and nothing else would redraw it.
+        applyOne(svgEl as SVGSVGElement, picker.node, color);
+        // Clearing an override puts the node back to whatever the semantic
+        // palette said, which only a fresh pass can decide.
+        if (!color && colored) {
+          void import("@/lib/explainer/semantics").then(({ applySemantics }) =>
+            applySemantics(svgEl as SVGSVGElement),
+          );
+        }
+      }
+      setOverrides(saveOverride(diagram, picker.node, color));
+      setPicker(null);
+    },
+    [colored, diagram, picker],
+  );
+
+  /** Open the picker on whichever node was clicked. */
+  const onHostClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    const target = event.target as Element | null;
+    const node = target?.closest?.(COLORABLE_NODES);
+    if (!node) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setPicker({
+      node: nodeKey(node),
+      // The node's own label, not its whole text content: the click-to-recolour
+      // tooltip is an SVG <title> living on the shape, and `textContent` would
+      // hand the reader "Click to change this block's colourOrdinary step".
+      label: (node.querySelector(".nodeLabel") ?? node).textContent?.trim() ?? "",
+      rect: node.getBoundingClientRect(),
+    });
+  }, []);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -729,19 +883,21 @@ function StaticStage({
     }
     setLoading(true);
     onError(null);
-    // Declared out here so the failure path can clean up after the same id.
-    const id = `static-${Math.random().toString(36).slice(2, 10)}`;
     const run = async () => {
       try {
-        const { default: mermaid } = await import("mermaid");
-        mermaid.initialize({
-          startOnLoad: false,
-          theme: dark ? "dark" : "default",
-          ...largeDiagramMermaidConfig(performanceMode),
-        });
-        const { svg } = await mermaid.render(id, code);
+        const { svg } = await renderMermaid(code, dark, Boolean(performanceMode));
         if (disposed) return;
-        if (performanceMode) {
+        // Stage two of the size gate. The source scan catches the obvious
+        // monsters, but a short, dense diagram — forty ER entities of thirty
+        // attributes — only reveals its true size once laid out. Measuring the
+        // result and downgrading here is what makes the guarantee hold for the
+        // diagrams the pre-scan cannot see.
+        const oversized = performanceMode || isRenderedDiagramTooLarge(svg);
+        if (oversized) {
+          setAsImage(true);
+          // Tell the parent only when the source scan had cleared it; a
+          // source-flagged diagram has already disabled those modes.
+          if (!performanceMode) onOversized?.();
           const view = readSvgViewBox(svg);
           if (view) {
             const measured = clampStageRatio(view.height / view.width);
@@ -774,6 +930,12 @@ function StaticStage({
             if (disposed) return;
             applySemantics(svgEl as SVGSVGElement);
           }
+          // The reader's own colours go on last, so they beat both the
+          // semantic palette and any fill the diagram's author set. The render
+          // cache hands back the same SVG string each time, so these have to be
+          // re-applied to every fresh copy rather than living in the markup.
+          applyOverrides(svgEl as SVGSVGElement, overridesRef.current);
+          markColorableNodes(svgEl as SVGSVGElement);
           svgEl.style.maxWidth = "100%";
           svgEl.style.width = "100%";
           svgEl.style.height = "100%";
@@ -790,7 +952,6 @@ function StaticStage({
         }
         setLoading(false);
       } catch (error) {
-        clearRenderArtifacts(id);
         if (disposed) return;
         setLoading(false);
         onError(describeRenderError(error));
@@ -804,9 +965,9 @@ function StaticStage({
       onPerformanceImage?.(null);
       if (host) host.innerHTML = "";
     };
-  }, [code, dark, colored, onError, onPerformanceImage, onRatio, performanceMode]);
+  }, [code, dark, colored, onError, onOversized, onPerformanceImage, onRatio, performanceMode]);
 
-  if (performanceMode) {
+  if (asImage) {
     return (
       <div className="relative min-h-64 w-full">
         {loading || !imageUrl ? (
@@ -841,12 +1002,22 @@ function StaticStage({
       )}
       <div
         ref={hostRef}
+        onClick={onHostClick}
         data-tall={!fill && ratio && isTallStage(ratio) ? "" : undefined}
         className={`${fill ? "h-full min-h-0 w-full" : "w-full box-content"}${
           colored ? " diagram-colored" : ""
         }`}
         style={fill ? undefined : stageBoxStyle(ratio ?? 0.42, TRAY_GUTTER, size ?? undefined)}
       />
+      {picker && (
+        <DiagramNodeColorPopover
+          anchor={picker.rect}
+          label={picker.label}
+          current={overrides[picker.node] ?? null}
+          onPick={pickColor}
+          onClose={() => setPicker(null)}
+        />
+      )}
     </div>
   );
 }

@@ -36,6 +36,8 @@ export interface PlayerState {
 }
 
 const CAMERA_EASE_MS = 620;
+/** How long a revisit target keeps pulsing after its edge lands. */
+const PULSE_TAIL_MS = 420;
 
 function easeInOut(t: number): number {
   return t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
@@ -51,6 +53,37 @@ export class ExplainerPlayer {
   private readonly home: Frame;
   /** Camera framing per step index, precomputed so a frame costs no layout. */
   private readonly frames: Frame[] = [];
+  /**
+   * Edges by id.
+   *
+   * `render` used to resolve each edge step with `edges.find(...)`, a linear
+   * scan, inside a loop over every step — which made drawing one frame
+   * quadratic in the size of the diagram. A 2,000-edge ERD spent millions of
+   * array probes per frame and took the tab with it. The map turns that into a
+   * hash lookup.
+   */
+  private readonly edgesById = new Map<string, ExplainerGraph["edges"][number]>();
+  /**
+   * Which elements the last painted frame actually touched.
+   *
+   * Repainting every node on every tick is the other half of the old cost: a
+   * node whose opacity is already 1 does not need its style rewritten sixty
+   * times a second, and each redundant write invalidates style for the whole
+   * subtree. Tracking what is currently non-default lets a frame touch only
+   * what changed between the previous `t` and this one.
+   */
+  private readonly paintedNodes = new Set<string>();
+  private readonly paintedEdges = new Set<string>();
+  private readonly pulsingNodes = new Set<string>();
+  /**
+   * How far the "everything before this is finished" pass has already run.
+   *
+   * Without it, settling walks every completed step on every frame — which is
+   * cheap per step but linear in the diagram, so a long run drifts back into
+   * exactly the per-frame cost this rewrite removed. Forward playback only
+   * settles what newly passed the playhead; a backwards seek rewinds it.
+   */
+  private settledThrough = 0;
   private raf = 0;
   private lastTick = 0;
   private time = 0;
@@ -69,6 +102,7 @@ export class ExplainerPlayer {
       this.schedule.push({ step, start: cursor, end: cursor + length });
       cursor += length;
     }
+    for (const edge of graph.edges) this.edgesById.set(edge.id, edge);
     this.follow = shouldFollow(graph);
     this.home = homeFrame(graph);
     this.frames = this.buildFrames();
@@ -130,6 +164,10 @@ export class ExplainerPlayer {
   destroy(): void {
     cancelAnimationFrame(this.raf);
     this.playing = false;
+    this.paintedNodes.clear();
+    this.paintedEdges.clear();
+    this.pulsingNodes.clear();
+    this.settledThrough = 0;
     const { svg } = this.graph;
     svg.parentElement?.removeAttribute("data-explainer");
     for (const node of this.graph.nodes.values()) {
@@ -164,10 +202,19 @@ export class ExplainerPlayer {
    * pre-roll state.
    */
   private render(t: number): void {
+    // Everything before the playhead is finished, everything after is still in
+    // its pre-roll state, and only the steps *straddling* `t` are in motion.
+    // Finding that window by binary search means a frame costs O(log n + k) in
+    // the number of steps actually animating, rather than O(steps × edges).
+    const active = this.activeRange(t);
+
     const shown = new Set<string>();
     const pulsing = new Set<string>();
 
-    for (const { step, start, end } of this.schedule) {
+    for (let index = active.first; index <= active.last; index++) {
+      const entry = this.schedule[index];
+      if (!entry) continue;
+      const { step, start, end } = entry;
       const span = end - start;
       const progress = span <= 0 ? 1 : (t - start) / span;
 
@@ -180,7 +227,7 @@ export class ExplainerPlayer {
         continue;
       }
 
-      const edge = this.graph.edges.find((candidate) => candidate.id === step.edgeId);
+      const edge = this.edgesById.get(step.edgeId);
       if (!edge) continue;
       const clamped = Math.min(1, Math.max(0, progress));
       this.paintEdge(edge, easeOut(clamped));
@@ -189,14 +236,114 @@ export class ExplainerPlayer {
       }
     }
 
-    // Nodes with no step under the playhead yet are still hidden; paintNode
-    // above only touched those whose reveal has started.
-    for (const node of this.graph.nodes.values()) {
-      if (!shown.has(node.id)) this.paintNode(node.id, 0);
-      node.el.classList.toggle("explainer-pulse", pulsing.has(node.id));
-    }
+    // Steps wholly behind the playhead are complete. Painting them once as
+    // they pass — and then leaving them alone — is what removes the per-frame
+    // walk over the whole diagram.
+    this.settleCompleted(active.first, shown);
+    // Anything still ahead of the playhead must be returned to its pre-roll
+    // state, but only if this frame moved backwards past it (a seek or a step
+    // back); forward playback never needs it.
+    this.resetPending(active.last, t);
+    this.syncPulse(pulsing);
 
     this.paintCamera(t);
+  }
+
+  /**
+   * The span of steps overlapping `t`, plus the short pulse tail after a
+   * revisit edge lands.
+   *
+   * The schedule is sorted and contiguous, so the first step whose `end`
+   * exceeds `t` is a binary search; from there we walk forward only while
+   * steps are still in flight, which is a handful even on a huge diagram.
+   */
+  private activeRange(t: number): { first: number; last: number } {
+    if (this.schedule.length === 0) return { first: 0, last: -1 };
+
+    let low = 0;
+    let high = this.schedule.length - 1;
+    let first = this.schedule.length;
+    while (low <= high) {
+      const mid = (low + high) >> 1;
+      // The pulse tail keeps a finished revisit "active" a little longer, so
+      // it is included in the search rather than handled as a special case.
+      if (this.schedule[mid].end + PULSE_TAIL_MS > t) {
+        first = mid;
+        high = mid - 1;
+      } else {
+        low = mid + 1;
+      }
+    }
+    if (first >= this.schedule.length) {
+      return { first: this.schedule.length, last: this.schedule.length - 1 };
+    }
+
+    let last = first;
+    while (last + 1 < this.schedule.length && this.schedule[last + 1].start <= t) last++;
+    return { first, last };
+  }
+
+  /**
+   * Bring everything before the active window to its finished state.
+   *
+   * Only the elements not already marked as painted are touched, so a step
+   * that completed twenty frames ago costs nothing now.
+   */
+  private settleCompleted(activeFirst: number, shown: Set<string>): void {
+    // A seek backwards leaves the cursor ahead of the playhead; drop it back so
+    // the steps between are settled again on the way forward.
+    if (activeFirst < this.settledThrough) this.settledThrough = activeFirst;
+    for (let index = this.settledThrough; index < activeFirst; index++) {
+      const { step } = this.schedule[index];
+      if (step.type === "reveal-node") {
+        shown.add(step.nodeId);
+        if (!this.paintedNodes.has(step.nodeId)) this.paintNode(step.nodeId, 1);
+        continue;
+      }
+      const edge = this.edgesById.get(step.edgeId);
+      if (edge && !this.paintedEdges.has(edge.id)) this.paintEdge(edge, 1);
+    }
+    this.settledThrough = Math.max(this.settledThrough, activeFirst);
+  }
+
+  /**
+   * Return steps ahead of the playhead to pre-roll, for a backwards seek.
+   *
+   * Forward playback leaves nothing to undo, so the common case exits without
+   * touching the DOM at all.
+   */
+  private resetPending(activeLast: number, t: number): void {
+    if (this.paintedNodes.size === 0 && this.paintedEdges.size === 0) return;
+    for (let index = activeLast + 1; index < this.schedule.length; index++) {
+      const { step, start } = this.schedule[index];
+      if (start > t + PULSE_TAIL_MS && !this.hasPainted(step)) break;
+      if (step.type === "reveal-node") {
+        if (this.paintedNodes.has(step.nodeId)) this.paintNode(step.nodeId, 0);
+        continue;
+      }
+      const edge = this.edgesById.get(step.edgeId);
+      if (edge && this.paintedEdges.has(edge.id)) this.paintEdge(edge, 0);
+    }
+  }
+
+  private hasPainted(step: ExplainerStep): boolean {
+    return step.type === "reveal-node"
+      ? this.paintedNodes.has(step.nodeId)
+      : this.paintedEdges.has(step.edgeId);
+  }
+
+  /** Move the pulse class to exactly the nodes that should carry it. */
+  private syncPulse(pulsing: Set<string>): void {
+    for (const nodeId of this.pulsingNodes) {
+      if (pulsing.has(nodeId)) continue;
+      this.graph.nodes.get(nodeId)?.el.classList.remove("explainer-pulse");
+    }
+    for (const nodeId of pulsing) {
+      if (this.pulsingNodes.has(nodeId)) continue;
+      this.graph.nodes.get(nodeId)?.el.classList.add("explainer-pulse");
+    }
+    this.pulsingNodes.clear();
+    for (const nodeId of pulsing) this.pulsingNodes.add(nodeId);
   }
 
   /**
@@ -216,11 +363,17 @@ export class ExplainerPlayer {
     node.el.style.opacity = `${easeOut(amount)}`;
     node.el.classList.toggle("explainer-hidden", amount <= 0);
     node.el.classList.toggle("explainer-shown", amount >= 1);
+    // Track only what is off its pre-roll default, so `resetPending` knows
+    // exactly which elements still need undoing after a backwards seek.
+    if (amount <= 0) this.paintedNodes.delete(nodeId);
+    else this.paintedNodes.add(nodeId);
   }
 
   private paintEdge(edge: ExplainerGraph["edges"][number], amount: number): void {
     const { path } = edge;
     path.style.strokeDashoffset = `${edge.length * (1 - amount)}`;
+    if (amount <= 0) this.paintedEdges.delete(edge.id);
+    else this.paintedEdges.add(edge.id);
     // The arrowhead comes back only once the stroke has actually landed, so
     // the arrow appears to arrive rather than to have been waiting.
     const marker = path.dataset.explainerMarker;

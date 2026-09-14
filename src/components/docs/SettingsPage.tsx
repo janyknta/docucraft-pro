@@ -23,6 +23,7 @@ import {
   registerCustomFont,
   unregisterCustomFont,
 } from "@/lib/custom-font";
+import { isValidGoogleFamily, loadGoogleFont, unloadGoogleFont } from "@/lib/google-font";
 import { AiSettings } from "./ai/AiSettings";
 import { Section, Group, Row, Empty, IconButton } from "./settings/primitives";
 import { Switch } from "@/components/ui/switch";
@@ -54,6 +55,8 @@ export interface SettingsPageProps {
   onSetReadingMode: (mode: ReadingMode) => void;
   readingFont: ReadingFont;
   onSetReadingFont: (font: ReadingFont) => void;
+  googleFont: string | null;
+  onSetGoogleFont: (family: string | null) => void;
   diagramColors: boolean;
   onSetDiagramColors: (on: boolean) => void;
   aiEnabled: boolean;
@@ -107,6 +110,8 @@ export function SettingsPage({
   onSetReadingMode,
   readingFont,
   onSetReadingFont,
+  googleFont,
+  onSetGoogleFont,
   diagramColors,
   onSetDiagramColors,
   aiEnabled,
@@ -217,6 +222,8 @@ export function SettingsPage({
                 onSetReadingMode={onSetReadingMode}
                 readingFont={readingFont}
                 onSetReadingFont={onSetReadingFont}
+                googleFont={googleFont}
+                onSetGoogleFont={onSetGoogleFont}
                 diagramColors={diagramColors}
                 onSetDiagramColors={onSetDiagramColors}
                 aiEnabled={aiEnabled}
@@ -235,6 +242,8 @@ export function SettingsPage({
                 onSetReadingMode={onSetReadingMode}
                 readingFont={readingFont}
                 onSetReadingFont={onSetReadingFont}
+                googleFont={googleFont}
+                onSetGoogleFont={onSetGoogleFont}
                 diagramColors={diagramColors}
                 onSetDiagramColors={onSetDiagramColors}
                 aiEnabled={aiEnabled}
@@ -307,6 +316,8 @@ function AppearanceSettings({
   onSetReadingMode,
   readingFont,
   onSetReadingFont,
+  googleFont,
+  onSetGoogleFont,
   diagramColors,
   onSetDiagramColors,
   aiEnabled,
@@ -322,6 +333,8 @@ function AppearanceSettings({
   onSetReadingMode: (mode: ReadingMode) => void;
   readingFont: ReadingFont;
   onSetReadingFont: (font: ReadingFont) => void;
+  googleFont: string | null;
+  onSetGoogleFont: (family: string | null) => void;
 }) {
   return (
     <div className="space-y-10">
@@ -365,7 +378,12 @@ function AppearanceSettings({
         </div>
       </Section>
 
-      <ReadingFontSettings readingFont={readingFont} onSetReadingFont={onSetReadingFont} />
+      <ReadingFontSettings
+        readingFont={readingFont}
+        onSetReadingFont={onSetReadingFont}
+        googleFont={googleFont}
+        onSetGoogleFont={onSetGoogleFont}
+      />
 
       <Section title="Layout">
         <Group>
@@ -535,14 +553,58 @@ function WorkspaceSettings({
 function ReadingFontSettings({
   readingFont,
   onSetReadingFont,
+  googleFont,
+  onSetGoogleFont,
 }: {
   readingFont: ReadingFont;
   onSetReadingFont: (font: ReadingFont) => void;
+  googleFont: string | null;
+  onSetGoogleFont: (family: string | null) => void;
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [customName, setCustomName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // The family being typed, kept separate from the saved one: a half-typed
+  // name must not knock the reader's working font out from under them.
+  const [familyDraft, setFamilyDraft] = useState(googleFont ?? "");
+  const [googleBusy, setGoogleBusy] = useState(false);
+  const [googleError, setGoogleError] = useState<string | null>(null);
+
+  const applyGoogleFamily = async () => {
+    const family = familyDraft.trim();
+    if (!family) return;
+    setGoogleError(null);
+    if (!isValidGoogleFamily(family)) {
+      setGoogleError("That doesn't look like a font family name.");
+      return;
+    }
+    setGoogleBusy(true);
+    try {
+      // Prove the family exists before saving it. Google answers an unknown
+      // name with a 400, and a saved-but-broken family would leave the reader
+      // silently on the fallback stack with no clue why.
+      await loadGoogleFont(family);
+      onSetGoogleFont(family);
+      onSetReadingFont("google");
+    } catch (error) {
+      setGoogleError(
+        error instanceof Error && error.message === "Could not reach Google Fonts"
+          ? "Could not reach Google Fonts."
+          : `No family called "${family}" on Google Fonts.`,
+      );
+    } finally {
+      setGoogleBusy(false);
+    }
+  };
+
+  const removeGoogleFamily = () => {
+    unloadGoogleFont();
+    onSetGoogleFont(null);
+    setFamilyDraft("");
+    setGoogleError(null);
+    if (readingFont === "google") onSetReadingFont("hyperlegible");
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -646,6 +708,66 @@ function ReadingFontSettings({
       </Group>
 
       {error && <p className="px-1 text-xs text-destructive">{error}</p>}
+
+      {/* A family hosted by Google, named rather than uploaded. Kept below the
+          upload because it is the option with a cost attached: the face is
+          fetched from Google's servers at read time, which is the one place
+          this reader stops being entirely local. */}
+      <Group className="mt-2.5">
+        {googleFont ? (
+          <div className="flex items-center gap-2 pr-2 transition-colors hover:bg-accent/40">
+            <button
+              onClick={() => onSetReadingFont("google")}
+              aria-pressed={readingFont === "google"}
+              className="flex min-w-0 flex-1 items-center justify-between gap-4 px-4 py-3 text-left"
+            >
+              <span className="min-w-0">
+                <span
+                  className="block truncate text-base text-foreground"
+                  style={{ fontFamily: `"${googleFont}", ui-sans-serif, sans-serif` }}
+                >
+                  {googleFont}
+                </span>
+                <span className="mt-0.5 block truncate text-xs text-muted-foreground">
+                  From Google Fonts
+                </span>
+              </span>
+              {readingFont === "google" && <Check className="h-4 w-4 shrink-0 text-primary" />}
+            </button>
+            <IconButton onClick={removeGoogleFamily} label="Remove Google font" danger>
+              <Trash2 className="h-4 w-4" />
+            </IconButton>
+          </div>
+        ) : (
+          <div className="px-4 py-3">
+            <div className="text-sm text-foreground">A font from Google Fonts</div>
+            <div className="mt-0.5 text-xs text-muted-foreground">
+              Type a family name, e.g. Lora or Source Serif 4. Fetched from Google when you read.
+            </div>
+            <div className="mt-2.5 flex items-center gap-2">
+              <input
+                value={familyDraft}
+                onChange={(e) => setFamilyDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void applyGoogleFamily();
+                }}
+                placeholder="Font family"
+                spellCheck={false}
+                className="min-w-0 flex-1 rounded-md border border-border bg-background px-2.5 py-1.5 text-sm outline-none focus:border-primary/60 focus:ring-2 focus:ring-primary/10"
+              />
+              <button
+                onClick={() => void applyGoogleFamily()}
+                disabled={googleBusy || !familyDraft.trim()}
+                className="shrink-0 rounded-md px-3 py-1.5 text-sm font-medium text-primary transition-colors hover:bg-primary/10 disabled:opacity-50"
+              >
+                {googleBusy ? "Loading…" : "Use"}
+              </button>
+            </div>
+          </div>
+        )}
+      </Group>
+
+      {googleError && <p className="px-1 text-xs text-destructive">{googleError}</p>}
 
       <input
         ref={fileRef}

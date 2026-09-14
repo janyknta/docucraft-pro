@@ -216,6 +216,14 @@
   --font-heading: "Localdox Custom", ui-sans-serif, system-ui, -apple-system, sans-serif;
   --font-ui: "Localdox Custom", ui-sans-serif, system-ui, -apple-system, sans-serif;
 }
+/* A family from Google Fonts. The name is not known until the reader picks one,
+   so it arrives as `--font-google-family`, set on <html> by google-font.ts; the
+   system stack behind it covers both the fetch and a family that failed. */
+[data-font="google"] {
+  --font-body: var(--font-google-family), ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-heading: var(--font-google-family), ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-ui: var(--font-google-family), ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
 
 @layer base {
   * {

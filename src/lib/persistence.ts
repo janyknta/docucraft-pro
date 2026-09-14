@@ -247,14 +247,17 @@ export type ReadingMode = "paginated" | "single";
 // distinction — plus whatever the reader uploads themselves. The other bundled
 // families were dropped: picking between five similar faces is not a decision
 // worth putting in front of someone who wants to read.
-export type ReadingFont = "hyperlegible" | "custom";
-export const READING_FONTS: readonly ReadingFont[] = ["hyperlegible", "custom"];
+export type ReadingFont = "hyperlegible" | "custom" | "google";
+export const READING_FONTS: readonly ReadingFont[] = ["hyperlegible", "custom", "google"];
 
 /** Old prefs name faces that are no longer bundled. They all collapse onto the
  *  one remaining built-in; "custom" only survives if a font is actually stored,
- *  which the caller checks separately. */
+ *  and "google" only if a family name was saved alongside it — both of which
+ *  the caller checks separately. */
 function migrateFont(font: unknown): ReadingFont {
-  return font === "custom" ? "custom" : "hyperlegible";
+  if (font === "custom") return "custom";
+  if (font === "google") return "google";
+  return "hyperlegible";
 }
 
 export interface Prefs {
@@ -283,6 +286,14 @@ export interface Prefs {
   namePrompted: boolean;
   readingMode: ReadingMode;
   readingFont: ReadingFont;
+  /**
+   * The Google Fonts family backing `readingFont: "google"`.
+   *
+   * Only the name is kept — the face itself is fetched from Google's CDN on
+   * boot. Null whenever the reader has never named one, which is also what
+   * makes the "google" choice inert until they do.
+   */
+  googleFont: string | null;
 }
 
 const PREFS_KEY = "localdox:prefs";
@@ -295,6 +306,7 @@ const DEFAULT_PREFS: Prefs = {
   namePrompted: false,
   readingMode: "paginated",
   readingFont: "hyperlegible",
+  googleFont: null,
 };
 
 export function loadPrefs(): Prefs {

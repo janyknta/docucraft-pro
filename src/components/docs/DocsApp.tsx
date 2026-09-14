@@ -60,6 +60,7 @@ import { getDocumentKind, importDocumentFile, SUPPORTED_ACCEPT } from "@/lib/doc
 import { clearArtifactResolutionCache } from "@/lib/workspace-artifacts";
 import { loadReadingFont, warmAppFonts } from "@/lib/fonts";
 import { restoreCustomFont } from "@/lib/custom-font";
+import { loadGoogleFont } from "@/lib/google-font";
 import { warmMarkdownPlugins } from "@/lib/markdown-plugins";
 import { toast } from "sonner";
 import { useHistory } from "@/hooks/use-history";
@@ -260,6 +261,7 @@ export function DocsApp() {
   const [theme, setTheme] = useState<Theme>(() => loadPrefs().theme);
   const [readingMode, setReadingMode] = useState<ReadingMode>(() => loadPrefs().readingMode);
   const [readingFont, setReadingFont] = useState<ReadingFont>(() => loadPrefs().readingFont);
+  const [googleFont, setGoogleFont] = useState<string | null>(() => loadPrefs().googleFont);
   const [diagramColors, setDiagramColors] = useState<boolean>(() => loadPrefs().diagramColors);
   const [aiEnabled, setAiEnabled] = useState<boolean>(() => loadPrefs().aiEnabled);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -509,6 +511,22 @@ export function DocsApp() {
     };
   }, []);
 
+  // A Google family is only a stored *name*, so the stylesheet has to be
+  // re-requested on every boot before `[data-font="google"]` can resolve it.
+  // A family that no longer loads (offline, renamed upstream) falls back rather
+  // than leaving the reader on a face that never arrives.
+  useEffect(() => {
+    if (!googleFont) return;
+    let cancelled = false;
+    void loadGoogleFont(googleFont).catch(() => {
+      if (cancelled) return;
+      setReadingFont((current) => (current === "google" ? "hyperlegible" : current));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [googleFont]);
+
   // Inter backs the app chrome, and syntax highlighting / math typesetting back
   // most documents. All three are requested off the critical path: the first
   // paint runs on system fonts and unhighlighted code, and each upgrade lands
@@ -575,6 +593,10 @@ export function DocsApp() {
   useEffect(() => {
     savePrefs({ readingFont });
   }, [readingFont]);
+
+  useEffect(() => {
+    savePrefs({ googleFont });
+  }, [googleFont]);
 
   // ---- persistence core ----
 
@@ -2314,6 +2336,8 @@ flowchart LR
         onSetReadingMode={setReadingMode}
         readingFont={readingFont}
         onSetReadingFont={setReadingFont}
+        googleFont={googleFont}
+        onSetGoogleFont={setGoogleFont}
         diagramColors={diagramColors}
         onSetDiagramColors={setDiagramColors}
         aiEnabled={aiEnabled}
