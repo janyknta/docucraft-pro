@@ -221,8 +221,19 @@ export function locateInSource(
   const toSource = (flatIdx: number) => proj.map[flat.map[flatIdx]];
   const spanFor = (flatStart: number, len: number): SourceSpan => {
     const start = toSource(flatStart);
-    const end = toSource(flatStart + len - 1) + 1;
-    return { start: Math.min(start, end), end: Math.max(start, end) };
+    // The end is taken from where the *next* character begins, not from the
+    // last one plus one. `compact` maps a collapsed run of whitespace to the
+    // first space in that run, so a match ending right before a space would
+    // otherwise reach past the word and select the space with it.
+    const lastFlat = flatStart + len - 1;
+    const afterIdx = lastFlat + 1 < flat.map.length ? toSource(lastFlat + 1) : null;
+    const end = afterIdx !== null ? afterIdx : toSource(lastFlat) + 1;
+    const lo = Math.min(start, end);
+    const hi = Math.max(start, end);
+    // Trailing whitespace is never part of what the reader pointed at.
+    let trimmed = hi;
+    while (trimmed > lo && /\s/.test(source[trimmed - 1])) trimmed--;
+    return { start: lo, end: trimmed > lo ? trimmed : hi };
   };
 
   const search = (hay: string): number => {
@@ -256,13 +267,90 @@ export function locateInSource(
     if (at !== -1) return spanFor(at, partial.length);
   }
 
-  // Last resort: the first word long enough to be distinctive.
-  const word = needle.split(" ").find((w) => w.length >= 4);
-  if (word) {
-    const at = search(word);
-    if (at !== -1) return spanFor(at, word.length);
+  // Last resort: a *rare* word from the selection, matched on a whole-word
+  // boundary.
+  //
+  // This step used to take the first word of four or more characters and jump
+  // to its first occurrence anywhere in the document. That is what made Inspect
+  // land on the wrong text: the first long word of a sentence is usually a
+  // common one ("which", "there", "value"), its first occurrence is rarely the
+  // copy the reader clicked, and a bare `indexOf` also matches inside longer
+  // words. Preferring the word that occurs least often — and requiring it to
+  // stand alone — picks the distinctive token instead, and a word that appears
+  // all over the document is no longer treated as an anchor at all.
+  const words = needle.split(" ").filter((w) => w.length >= 4);
+  let best: { at: number; len: number; count: number } | null = null;
+  for (const word of words) {
+    const at = searchWord(word);
+    if (at === -1) continue;
+    const count = countWord(flat.text, word);
+    if (count === 0) continue;
+    if (!best || count < best.count) best = { at, len: word.length, count };
+    if (count === 1) break;
   }
+  // A token that appears more than a couple of times says nothing about where
+  // the reader was looking, so there is nothing to anchor to: opening the
+  // editor at the section start (what the caller does with `null`) is more
+  // honest than a confident wrong jump.
+  //
+  // The ceiling is deliberately low. An earlier draft allowed up to eight
+  // occurrences, which in practice never rejected anything — an ordinary word
+  // like "value" appears five or six times in a short document and would still
+  // be treated as a landmark, which is the exact failure this step exists to
+  // avoid. Two occurrences is the most that can still be called distinctive,
+  // and only when the reader's section (`prefer`) does not already own one.
+  const ANCHOR_MAX_OCCURRENCES = 2;
+  if (best && best.count <= ANCHOR_MAX_OCCURRENCES) return spanFor(best.at, best.len);
   return null;
+
+  /** `search`, restricted to matches that aren't inside a longer word. */
+  function searchWord(word: string): number {
+    const isBoundary = (index: number) => {
+      const before = index > 0 ? flat.text[index - 1] : " ";
+      const after = index + word.length < flat.text.length ? flat.text[index + word.length] : " ";
+      return !/[A-Za-z0-9]/.test(before) && !/[A-Za-z0-9]/.test(after);
+    };
+    // Inside `prefer` first, for the same reason `search` does: the section on
+    // screen owns the match when it has one.
+    if (prefer) {
+      let lo = -1;
+      let hi = -1;
+      for (let i = 0; i < flat.map.length; i++) {
+        const s = toSource(i);
+        if (s >= prefer.from && s < prefer.to) {
+          if (lo === -1) lo = i;
+          hi = i;
+        }
+      }
+      if (lo !== -1) {
+        const scoped = flat.text.slice(lo, hi + 1);
+        let local = scoped.indexOf(word);
+        while (local !== -1) {
+          if (isBoundary(lo + local)) return lo + local;
+          local = scoped.indexOf(word, local + 1);
+        }
+      }
+    }
+    let at = flat.text.indexOf(word);
+    while (at !== -1) {
+      if (isBoundary(at)) return at;
+      at = flat.text.indexOf(word, at + 1);
+    }
+    return -1;
+  }
+}
+
+/** Whole-word occurrences of `word` in `hay`, capped — only rarity matters. */
+function countWord(hay: string, word: string, cap = 32): number {
+  let count = 0;
+  let at = hay.indexOf(word);
+  while (at !== -1 && count < cap) {
+    const before = at > 0 ? hay[at - 1] : " ";
+    const after = at + word.length < hay.length ? hay[at + word.length] : " ";
+    if (!/[A-Za-z0-9]/.test(before) && !/[A-Za-z0-9]/.test(after)) count++;
+    at = hay.indexOf(word, at + 1);
+  }
+  return count;
 }
 
 /**

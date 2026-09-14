@@ -20,6 +20,24 @@ export interface PersistedFile {
   kind?: import("./markdown-utils").DocumentKind;
   /** Sidebar folder this file is filed under; null/undefined = top level. */
   folderId?: string | null;
+  /**
+   * Epoch ms the file was moved to the Bin, or null/undefined when it is live.
+   *
+   * The Bin replaced a separate Archive and Delete: one reversible action, with
+   * the reversal window written down rather than implied. Anything older than
+   * BIN_RETENTION_MS is purged when the workspace loads — there is no
+   * background process in a local-first app, so "30 days" means "swept the next
+   * time the app is opened after 30 days".
+   */
+  deletedAt?: number | null;
+}
+
+/** How long a binned document is recoverable before it is purged. */
+export const BIN_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** True when a binned file has outlived the recovery window. */
+export function isBinExpired(deletedAt: number | null | undefined, now = Date.now()): boolean {
+  return typeof deletedAt === "number" && now - deletedAt >= BIN_RETENTION_MS;
 }
 
 /**
@@ -32,6 +50,31 @@ export interface FolderRecord {
   id: string;
   name: string;
   createdAt: number;
+  /**
+   * Folder this one sits inside; null/undefined = top level.
+   *
+   * Nesting is stored the same way filing is: a flat list with a pointer up,
+   * rather than folders containing folders. A record whose parent is missing
+   * (deleted, or dropped by an older build that never wrote this field) is
+   * rendered at the top level instead of disappearing with its documents.
+   */
+  parentId?: string | null;
+}
+
+/**
+ * One column of the reader, holding its own ordered tabs.
+ *
+ * Panes own their tabs and the app derives the single "active file" from
+ * whichever pane has focus. That way the sidebar, the command palette, stars
+ * and the nav trail all keep asking the same question they always did, and
+ * only the answer's source changes.
+ */
+export interface PersistedPane {
+  id: string;
+  /** File ids, in tab order. */
+  tabs: string[];
+  /** Which of `tabs` is on screen in this pane. */
+  activeTabId: string | null;
 }
 
 export interface PersistedUI {
@@ -42,6 +85,13 @@ export interface PersistedUI {
   fileOrder?: string[];
   /** File ids in most-recently-opened order — drives the "Recent" chip. */
   recentFileIds?: string[];
+  /**
+   * Split layout. Absent or empty in a workspace written before panes existed,
+   * which reads as a single pane holding `activeFileId` — so an older workspace
+   * opens exactly as it used to.
+   */
+  panes?: PersistedPane[];
+  focusedPaneId?: string | null;
 }
 
 import type { Highlight } from "./dom-highlighter";
@@ -193,6 +243,8 @@ export function emptyUI(): PersistedUI {
     scrollTop: 0,
     fileOrder: [],
     recentFileIds: [],
+    panes: [],
+    focusedPaneId: null,
   };
 }
 
@@ -247,14 +299,17 @@ export type ReadingMode = "paginated" | "single";
 // distinction — plus whatever the reader uploads themselves. The other bundled
 // families were dropped: picking between five similar faces is not a decision
 // worth putting in front of someone who wants to read.
-export type ReadingFont = "hyperlegible" | "custom";
-export const READING_FONTS: readonly ReadingFont[] = ["hyperlegible", "custom"];
+export type ReadingFont = "hyperlegible" | "custom" | "google";
+export const READING_FONTS: readonly ReadingFont[] = ["hyperlegible", "custom", "google"];
 
 /** Old prefs name faces that are no longer bundled. They all collapse onto the
  *  one remaining built-in; "custom" only survives if a font is actually stored,
- *  which the caller checks separately. */
+ *  and "google" only if a family name was saved alongside it — both of which
+ *  the caller checks separately. */
 function migrateFont(font: unknown): ReadingFont {
-  return font === "custom" ? "custom" : "hyperlegible";
+  if (font === "custom") return "custom";
+  if (font === "google") return "google";
+  return "hyperlegible";
 }
 
 export interface Prefs {
@@ -283,6 +338,14 @@ export interface Prefs {
   namePrompted: boolean;
   readingMode: ReadingMode;
   readingFont: ReadingFont;
+  /**
+   * The Google Fonts family backing `readingFont: "google"`.
+   *
+   * Only the name is kept — the face itself is fetched from Google's CDN on
+   * boot. Null whenever the reader has never named one, which is also what
+   * makes the "google" choice inert until they do.
+   */
+  googleFont: string | null;
 }
 
 const PREFS_KEY = "localdox:prefs";
@@ -295,6 +358,7 @@ const DEFAULT_PREFS: Prefs = {
   namePrompted: false,
   readingMode: "paginated",
   readingFont: "hyperlegible",
+  googleFont: null,
 };
 
 export function loadPrefs(): Prefs {
@@ -357,12 +421,15 @@ export function parseWorkspaceImport(json: string): WorkspaceRecord {
         folderId: typeof f.folderId === "string" ? f.folderId : null,
       })),
     folders: Array.isArray(w.folders)
-      ? (w.folders as Partial<FolderRecord>[])
+      ? (w.folders as Partial<FolderRecord & { parentId?: unknown }>[])
           .filter((f) => f && typeof f.id === "string" && typeof f.name === "string")
           .map((f) => ({
             id: f.id as string,
             name: f.name as string,
             createdAt: typeof f.createdAt === "number" ? f.createdAt : now,
+            // Nesting has to survive a share link or a re-import. Dropping this
+            // would silently flatten every subfolder into the top level.
+            parentId: typeof f.parentId === "string" ? f.parentId : null,
           }))
       : [],
     bookmarks: Array.isArray(w.bookmarks)
@@ -376,6 +443,18 @@ export function parseWorkspaceImport(json: string): WorkspaceRecord {
       scrollTop: typeof w.ui?.scrollTop === "number" ? w.ui.scrollTop : 0,
       fileOrder: Array.isArray(w.ui?.fileOrder) ? w.ui.fileOrder : [],
       recentFileIds: Array.isArray(w.ui?.recentFileIds) ? w.ui.recentFileIds : [],
+      // The split layout has to survive a reload or a share link. Dropping it
+      // here would silently collapse every workspace back to one pane.
+      panes: Array.isArray(w.ui?.panes)
+        ? (w.ui.panes as Partial<PersistedPane>[])
+            .filter((pane) => pane && typeof pane.id === "string" && Array.isArray(pane.tabs))
+            .map((pane) => ({
+              id: pane.id as string,
+              tabs: (pane.tabs as unknown[]).filter((id): id is string => typeof id === "string"),
+              activeTabId: typeof pane.activeTabId === "string" ? pane.activeTabId : null,
+            }))
+        : [],
+      focusedPaneId: typeof w.ui?.focusedPaneId === "string" ? w.ui.focusedPaneId : null,
     },
   };
 }

@@ -119,6 +119,20 @@ function planSequence(graph: ExplainerGraph): ExplainerPlan {
   };
 }
 
+/**
+ * Past this many steps, a step-through has stopped being an explanation.
+ *
+ * Each step is a beat the reader is meant to watch; at a few thousand the run
+ * is over an hour long and nobody is watching it. The ceiling exists as much
+ * for that reason as for the cost of scheduling the steps.
+ */
+export const MAX_EXPLAINER_STEPS = 4_000;
+
+/** Whether this graph is small enough to be worth stepping through at all. */
+export function canExplain(graph: ExplainerGraph): boolean {
+  return graph.nodes.size + graph.edges.length <= MAX_EXPLAINER_STEPS;
+}
+
 export function planExplainer(graph: ExplainerGraph): ExplainerPlan {
   if (graph.svg.getAttribute("aria-roledescription") === "sequence") {
     return planSequence(graph);

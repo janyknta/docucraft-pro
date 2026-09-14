@@ -11,7 +11,6 @@ import {
   GripVertical,
   Check,
   Plus,
-  Highlighter,
   Sparkles,
   PanelLeft,
   Search,
@@ -33,11 +32,11 @@ import {
   FolderPlus,
   FolderInput,
   FilePlus,
-  Archive,
   Download,
   Upload,
   CheckSquare,
   Share2,
+  Columns2,
   Hash,
   Table,
   Code,
@@ -50,6 +49,7 @@ import type { LucideIcon } from "lucide-react";
 import { splitIntoSubtopics } from "@/lib/markdown-utils";
 import type { Highlight } from "@/lib/dom-highlighter";
 import { savedTypeLabel, type SavedEntry, type SavedItem } from "@/lib/saved-items";
+import { BIN_RETENTION_MS } from "@/lib/persistence";
 import type { MdFile, DocumentKind } from "@/lib/markdown-utils";
 import { readingMinutes } from "@/lib/markdown-utils";
 import { fileLabel, getDocumentKind } from "@/lib/document-utils";
@@ -122,7 +122,7 @@ function savedByFile(items: SavedEntry[]): Array<[string, SavedEntry[]]> {
 export type SidebarView = {
   sort: "manual" | "name" | "date";
   dir: "asc" | "desc";
-  mode: "all" | "grouped" | "saved";
+  mode: "all" | "grouped" | "saved" | "bin";
 };
 export const DEFAULT_VIEW: SidebarView = {
   sort: "manual",
@@ -131,17 +131,20 @@ export const DEFAULT_VIEW: SidebarView = {
 };
 
 /** The list's three views, in the order the picker offers them. */
-const VIEW_MODES: readonly SidebarView["mode"][] = ["all", "grouped", "saved"];
+const VIEW_MODES: readonly SidebarView["mode"][] = ["all", "grouped", "saved", "bin"];
 const VIEW_LABEL: Record<SidebarView["mode"], string> = {
   all: "All files",
   grouped: "Grouped",
   saved: "Saved",
+  bin: "Bin",
 };
 
 /** A sidebar folder, as far as the sidebar is concerned. */
 export interface SidebarFolder {
   id: string;
   name: string;
+  /** Folder this one sits inside; null/undefined = top level. */
+  parentId?: string | null;
 }
 
 /**
@@ -150,6 +153,12 @@ export interface SidebarFolder {
  * file dragged in from the desktop still reaches the uploader.
  */
 const FILE_DND = "application/x-localdox-file";
+/**
+ * Drag payload for re-parenting a folder. Its own type, so a folder row accepts
+ * a dragged folder and a dragged document as two different drops — and so the
+ * reorder drag, which carries no data at all, still matches neither.
+ */
+const FOLDER_DND = "application/x-localdox-folder";
 
 interface Props {
   files: MdFile[];
@@ -164,7 +173,6 @@ interface Props {
   /** Open a document in the editor. Only offered for editable text documents. */
   onEditFile?: (id: string) => void;
   /** Star / unstar a whole document from its row menu. */
-  onToggleFileStar?: (id: string) => void;
   /**
    * Folders the workspace has, flat. Files point at one through `folderId`;
    * anything unfiled stays at the top level under the folder rows.
@@ -175,7 +183,14 @@ interface Props {
   /** Create an animated standalone Mermaid source file. */
   onCreateMermaid?: (folderId?: string | null) => void;
   onCreateBoard?: (folderId?: string | null) => void;
-  onCreateFolder?: (name: string) => void;
+  /** Create a folder, optionally nested inside an existing one. */
+  onCreateFolder?: (name: string, parentId?: string | null) => void;
+  /** Re-parent a folder. `null` puts it back at the top level. */
+  onMoveFolderToFolder?: (folderId: string, parentId: string | null) => void;
+  /** Bring a binned document back into the workspace. */
+  onRestoreFromBin?: (id: string) => void;
+  /** Delete one binned document for good, from the Bin view. */
+  onDeleteForever?: (id: string) => void;
   onRenameFolder?: (id: string, name: string) => void;
   /** Deleting a folder keeps its documents — they return to the top level. */
   onDeleteFolder?: (id: string) => void;
@@ -193,13 +208,18 @@ interface Props {
   onRemoveSaved: (id: string) => void;
   onRemoveHighlight: (id: string) => void;
   /** Open the isolated "highlights only" view for a file (text-based only). */
-  onShowHighlights?: (fileId: string) => void;
   onReorderFile?: (oldIndex: number, newIndex: number) => void;
   onSortByName?: () => void;
   view?: SidebarView;
   onView?: (view: SidebarView) => void;
   /** Opens settings. An optional tab id lands the dialog on that section. */
   onOpenSettings: (tab?: "workspace") => void;
+  /** Open the Saved page, where stars and highlights live together. */
+  onOpenSavedPage?: () => void;
+  /** Ids already showing in a side-by-side column. */
+  splitFileIds?: string[];
+  /** Put this document in a column of its own, beside what is being read. */
+  onAddToSplit?: (fileId: string) => void;
   /** Open the Ask AI panel. When omitted, the Ask AI button is hidden. */
   onAskAi?: () => void;
   onNewWorkspace?: (name?: string) => void;
@@ -212,7 +232,6 @@ interface Props {
   currentWorkspaceId?: string | null;
   onSwitchWorkspace?: (id: string) => void;
   onDeleteWorkspace?: (id: string) => void;
-  onArchiveFile?: (id: string) => void;
   onDownloadFile?: (id: string) => void;
   /** Copy a link to one file. The recipient chooses where it lands. */
   onShareFile?: (id: string) => void;
@@ -239,7 +258,6 @@ function SidebarImpl({
   onRemoveFile,
   onRenameFile,
   onEditFile,
-  onToggleFileStar,
   folders = [],
   onCreateFile,
   onCreateMermaid,
@@ -248,6 +266,9 @@ function SidebarImpl({
   onRenameFolder,
   onDeleteFolder,
   onMoveFileToFolder,
+  onMoveFolderToFolder,
+  onRestoreFromBin,
+  onDeleteForever,
   saved,
   currentWorkspaceName,
   canDeleteWorkspace,
@@ -258,12 +279,14 @@ function SidebarImpl({
   onOpenSaved,
   onRemoveSaved,
   onRemoveHighlight,
-  onShowHighlights,
   onReorderFile,
   onSortByName,
   view = DEFAULT_VIEW,
   onView,
   onOpenSettings,
+  onOpenSavedPage,
+  splitFileIds = [],
+  onAddToSplit,
   onAskAi,
   onNewWorkspace,
   onImportWorkspace,
@@ -273,7 +296,6 @@ function SidebarImpl({
   currentWorkspaceId,
   onSwitchWorkspace,
   onDeleteWorkspace,
-  onArchiveFile,
   onDownloadFile,
   onShareFile,
   onShareFiles,
@@ -288,10 +310,6 @@ function SidebarImpl({
   // Which documents are starred as a whole — the star in each row's menu
   // reflects this. Section and block stars are excluded: they say nothing about
   // whether the document itself is starred.
-  const starredFileIds = useMemo(
-    () => new Set(saved.filter((item) => item.kind === "file").map((item) => item.fileId)),
-    [saved],
-  );
 
   // Progressive disclosure: chapters stay collapsed unless the reader opens
   // them; the current chapter is expanded automatically. This keeps the
@@ -335,10 +353,17 @@ function SidebarImpl({
     });
   };
 
-  const promptNewFolder = () => {
+  const promptNewFolder = (parentId?: string | null) => {
     const name = window.prompt("Folder name:", "New folder");
-    if (name && name.trim()) onCreateFolder?.(name.trim());
+    if (name && name.trim()) onCreateFolder?.(name.trim(), parentId ?? null);
   };
+
+  // Folder currently being dragged, so a row is never offered as a drop target
+  // for itself and the root zone doesn't light up under its own drag.
+  const [draggingFolderId, setDraggingFolderId] = useState<string | null>(null);
+  // Document currently being dragged into (or out of) a folder. The top-level
+  // drop zone highlights only while one is in flight.
+  const [draggingFileId, setDraggingFileId] = useState<string | null>(null);
 
   // "Create" opens a small File/Folder menu; "view" picks what the list below
   // shows. Both are click-away dropdowns anchored to their own button.
@@ -369,7 +394,10 @@ function SidebarImpl({
 
   const total = files.length;
 
-  const activeFiles = files.filter((f) => !f.isArchived);
+  // Binned documents are out of the list entirely — they live in the Bin view
+  // until they are restored or purged.
+  const activeFiles = files.filter((f) => !f.isArchived && !f.deletedAt);
+  const binnedFiles = files.filter((f) => !!f.deletedAt);
 
   // Multi-select shortcuts. Read through a ref so the listener isn't torn down
   // and rebuilt on every render just because `activeFiles` is a fresh array.
@@ -455,26 +483,174 @@ function SidebarImpl({
   const rootFiles = sorted.filter((f) => !f.folderId || !knownFolderIds.has(f.folderId));
   const listed = showFolders ? rootFiles : sorted;
 
-  /** Drop handlers that file a dragged document into `folderId` (null = top). */
+  /**
+   * Drop handlers for `folderId` (null = top level).
+   *
+   * Accepts both drags: a document being filed, and a folder being re-parented.
+   * `stopPropagation` on the drop matters now that folders nest — without it a
+   * drop on a child folder would bubble to every ancestor's handler and the
+   * outermost one would win.
+   */
   const dropTargetProps = (folderId: string | null) => {
-    if (!onMoveFileToFolder) return {};
+    if (!onMoveFileToFolder && !onMoveFolderToFolder) return {};
+    const accepts = (e: React.DragEvent) =>
+      (!!onMoveFileToFolder && e.dataTransfer.types.includes(FILE_DND)) ||
+      (!!onMoveFolderToFolder && e.dataTransfer.types.includes(FOLDER_DND));
     return {
       onDragOver: (e: React.DragEvent) => {
-        if (!e.dataTransfer.types.includes(FILE_DND)) return;
+        if (!accepts(e)) return;
         e.preventDefault();
+        e.stopPropagation();
         e.dataTransfer.dropEffect = "move" as const;
         setDropFolderId(folderId);
       },
       onDragLeave: () => setDropFolderId((current) => (current === folderId ? null : current)),
       onDrop: (e: React.DragEvent) => {
+        if (!accepts(e)) return;
         const fileId = e.dataTransfer.getData(FILE_DND);
+        const draggedFolder = e.dataTransfer.getData(FOLDER_DND);
         setDropFolderId(null);
-        if (!fileId) return;
+        if (!fileId && !draggedFolder) return;
         e.preventDefault();
         e.stopPropagation();
-        onMoveFileToFolder(fileId, folderId);
+        if (fileId) onMoveFileToFolder?.(fileId, folderId);
+        // A folder dropped on itself is a no-op rather than a cycle; the parent
+        // guards the deeper case (dropping onto one's own descendant).
+        else if (draggedFolder && draggedFolder !== folderId) {
+          onMoveFolderToFolder?.(draggedFolder, folderId);
+        }
       },
     };
+  };
+
+  /**
+   * The folder tree, derived from the flat list.
+   *
+   * A folder whose parent is missing — deleted, or never written by an older
+   * build — is treated as a root rather than dropped, so nothing it holds can
+   * become unreachable.
+   */
+  const childrenOf = (parentId: string | null) =>
+    folders.filter((f) => {
+      const parent = f.parentId ?? null;
+      if (parent === parentId) return true;
+      return parentId === null && parent !== null && !knownFolderIds.has(parent);
+    });
+  const rootFolders = childrenOf(null);
+
+  /**
+   * One folder and everything under it.
+   *
+   * Recursive rather than a flattened list with an indent level: the nesting is
+   * what makes a drop land in the right folder, and each level owns its own
+   * drop target and collapse state. `depth` only guards against a cycle that
+   * survived the parent's checks — a corrupt import, say — so the sidebar
+   * cannot be made to recurse forever.
+   */
+  const renderFolder = (folder: SidebarFolder, depth: number): React.ReactNode => {
+    if (depth > 12) return null;
+    const items = sorted.filter((f) => f.folderId === folder.id);
+    const subfolders = childrenOf(folder.id);
+    const collapsed = collapsedFolders.has(folder.id);
+    const isDropTarget = dropFolderId === folder.id && draggingFolderId !== folder.id;
+    const count = items.length + subfolders.length;
+    return (
+      <div
+        key={folder.id}
+        className={`mb-1.5 rounded-lg ${isDropTarget ? "ring-2 ring-primary/60" : ""} ${
+          draggingFolderId === folder.id ? "opacity-40" : ""
+        }`}
+        {...dropTargetProps(folder.id)}
+      >
+        <div
+          className="group flex items-center gap-1 rounded-lg px-1"
+          draggable={!!onMoveFolderToFolder && !selecting}
+          onDragStart={
+            onMoveFolderToFolder && !selecting
+              ? (e) => {
+                  e.stopPropagation();
+                  e.dataTransfer.setData(FOLDER_DND, folder.id);
+                  e.dataTransfer.effectAllowed = "move";
+                  setDraggingFolderId(folder.id);
+                }
+              : undefined
+          }
+          onDragEnd={
+            onMoveFolderToFolder && !selecting
+              ? () => {
+                  setDraggingFolderId(null);
+                  setDropFolderId(null);
+                }
+              : undefined
+          }
+        >
+          <button
+            onClick={() => toggleFolder(folder.id)}
+            className="flex min-w-0 flex-1 items-center gap-2 rounded-md py-2 pl-2 pr-1.5 text-left"
+            aria-expanded={!collapsed}
+          >
+            <ChevronRight
+              className={`h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform ${
+                collapsed ? "" : "rotate-90"
+              }`}
+              aria-hidden
+            />
+            {collapsed ? (
+              <Folder className="h-3.5 w-3.5 shrink-0 text-muted-foreground/70" aria-hidden />
+            ) : (
+              <FolderOpen className="h-3.5 w-3.5 shrink-0 text-muted-foreground/70" aria-hidden />
+            )}
+            <span className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground/80">
+              {folder.name}
+            </span>
+            <span className="shrink-0 text-xs tabular-nums text-muted-foreground">{count}</span>
+          </button>
+          <FolderMenu
+            onNewFile={onCreateFile ? () => onCreateFile(folder.id) : undefined}
+            onNewMermaid={onCreateMermaid ? () => onCreateMermaid(folder.id) : undefined}
+            onNewBoard={onCreateBoard ? () => onCreateBoard(folder.id) : undefined}
+            // Creates *inside* this folder now, rather than another one beside
+            // it at the top level.
+            onNewFolder={onCreateFolder ? () => promptNewFolder(folder.id) : undefined}
+            onRename={
+              onRenameFolder
+                ? () => {
+                    const next = window.prompt("Rename folder to:", folder.name);
+                    if (next && next.trim() && next.trim() !== folder.name) {
+                      onRenameFolder(folder.id, next.trim());
+                    }
+                  }
+                : undefined
+            }
+            onDelete={
+              onDeleteFolder
+                ? () => {
+                    if (
+                      count === 0 ||
+                      window.confirm(
+                        `Delete "${folder.name}"? Its ${count} item${
+                          count > 1 ? "s" : ""
+                        } move back to the top level.`,
+                      )
+                    ) {
+                      onDeleteFolder(folder.id);
+                    }
+                  }
+                : undefined
+            }
+          />
+        </div>
+        {!collapsed && (
+          <div className="ml-4 border-l border-border pl-1">
+            {subfolders.map((child) => renderFolder(child, depth + 1))}
+            {items.map(renderFileRow)}
+            {count === 0 && (
+              <p className="px-2 py-2 text-xs text-muted-foreground">Empty — drag a file here.</p>
+            )}
+          </div>
+        )}
+      </div>
+    );
   };
 
   const groups =
@@ -523,6 +699,7 @@ function SidebarImpl({
                 ? (e) => {
                     e.dataTransfer.setData(FILE_DND, file.id);
                     e.dataTransfer.effectAllowed = "move";
+                    setDraggingFileId(file.id);
                   }
                 : undefined
           }
@@ -548,6 +725,7 @@ function SidebarImpl({
               ? () => {
                   endDrag();
                   setDropFolderId(null);
+                  setDraggingFileId(null);
                 }
               : undefined
           }
@@ -605,8 +783,6 @@ function SidebarImpl({
           </button>
           {!selecting ? (
             <FileMenu
-              onToggleStar={onToggleFileStar ? () => onToggleFileStar(file.id) : undefined}
-              isStarred={starredFileIds.has(file.id)}
               // The file types with an editor behind them. A PDF or a
               // spreadsheet has no edit mode to enter, so the item is absent
               // rather than present and inert.
@@ -622,20 +798,16 @@ function SidebarImpl({
                   onRenameFile(file.id, newName);
                 }
               }}
-              onDelete={() => onRemoveFile(file.id)}
+              onMoveToBin={() => onRemoveFile(file.id)}
               folders={folders}
               currentFolderId={file.folderId ?? null}
               onMoveToFolder={
                 onMoveFileToFolder ? (folderId) => onMoveFileToFolder(file.id, folderId) : undefined
               }
-              onArchive={onArchiveFile ? () => onArchiveFile(file.id) : undefined}
+              onAddToSplit={onAddToSplit ? () => onAddToSplit(file.id) : undefined}
+              alreadyInSplit={splitFileIds.includes(file.id)}
               onDownload={onDownloadFile ? () => onDownloadFile(file.id) : undefined}
               onShare={onShareFile ? () => onShareFile(file.id) : undefined}
-              onShowHighlights={
-                onShowHighlights && (kind === "markdown" || kind === "text")
-                  ? () => onShowHighlights(file.id)
-                  : undefined
-              }
               reordering={reordering}
               onToggleReorder={canReorder ? toggleReorder : undefined}
               onSelectMode={() => {
@@ -654,15 +826,11 @@ function SidebarImpl({
                     }
                   : undefined
               }
-              onArchive={
-                onArchiveFile
-                  ? () => {
-                      selectedIds.forEach((id) => onArchiveFile(id));
-                      setSelecting(false);
-                      setSelectedIds(new Set());
-                    }
-                  : undefined
-              }
+              onMoveToBin={() => {
+                selectedIds.forEach((id) => onRemoveFile(id));
+                setSelecting(false);
+                setSelectedIds(new Set());
+              }}
               onDownload={
                 onDownloadFile
                   ? () => {
@@ -672,17 +840,6 @@ function SidebarImpl({
                     }
                   : undefined
               }
-              onDelete={() => {
-                if (
-                  window.confirm(
-                    `Are you sure you want to delete ${selectedIds.size} selected files?`,
-                  )
-                ) {
-                  selectedIds.forEach((id) => onRemoveFile(id));
-                  setSelecting(false);
-                  setSelectedIds(new Set());
-                }
-              }}
               onCancel={() => {
                 setSelecting(false);
                 setSelectedIds(new Set());
@@ -816,7 +973,70 @@ function SidebarImpl({
             </button>
           </div>
         )}
-        {view.mode === "saved" ? (
+        {view.mode === "bin" ? (
+          binnedFiles.length === 0 ? (
+            <p className="px-2 py-4 text-sm text-muted-foreground">
+              The Bin is empty. Removed files wait here for 30 days.
+            </p>
+          ) : (
+            <ul className="space-y-1">
+              {binnedFiles.map((file) => {
+                const left = Math.max(
+                  0,
+                  Math.ceil(
+                    ((file.deletedAt as number) + BIN_RETENTION_MS - Date.now()) /
+                      (24 * 60 * 60 * 1000),
+                  ),
+                );
+                const KindIcon = kindIcon(kindOf(file));
+                return (
+                  <li
+                    key={file.id}
+                    className="group flex items-start gap-1 rounded-lg px-1 hover:bg-accent/60"
+                  >
+                    <div className="flex min-w-0 flex-1 items-start gap-2 py-2 pl-2 pr-1.5">
+                      <KindIcon
+                        className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground"
+                        aria-hidden
+                      />
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-sm text-foreground/80">
+                          {file.name}
+                        </span>
+                        <span className="mt-0.5 block text-xs text-muted-foreground">
+                          {left === 0
+                            ? "Deletes on next open"
+                            : `${left} day${left === 1 ? "" : "s"} left`}
+                        </span>
+                      </span>
+                    </div>
+                    {onRestoreFromBin && (
+                      <button
+                        onClick={() => onRestoreFromBin(file.id)}
+                        className="mt-1.5 shrink-0 rounded px-2 py-0.5 text-xs font-medium text-primary transition-colors hover:bg-primary/10"
+                      >
+                        Restore
+                      </button>
+                    )}
+                    {onDeleteForever && (
+                      <button
+                        onClick={() => {
+                          if (window.confirm(`Permanently delete "${file.name}"?`)) {
+                            onDeleteForever(file.id);
+                          }
+                        }}
+                        aria-label="Delete forever"
+                        className="mt-1.5 flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:text-destructive"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )
+        ) : view.mode === "saved" ? (
           saved.length === 0 ? (
             <p className="px-2 py-4 text-sm text-muted-foreground">
               No saved items yet. Star a document, a section, a table or a code block.
@@ -871,97 +1091,23 @@ function SidebarImpl({
           )
         ) : total === 0 && folders.length === 0 ? null : (
           <>
-            {showFolders &&
-              folders.map((folder) => {
-                const items = sorted.filter((f) => f.folderId === folder.id);
-                const collapsed = collapsedFolders.has(folder.id);
-                const isDropTarget = dropFolderId === folder.id;
-                return (
-                  <div
-                    key={folder.id}
-                    className={`mb-1.5 rounded-lg ${isDropTarget ? "ring-2 ring-primary/60" : ""}`}
-                    {...dropTargetProps(folder.id)}
-                  >
-                    <div className="group flex items-center gap-1 rounded-lg px-1">
-                      <button
-                        onClick={() => toggleFolder(folder.id)}
-                        className="flex min-w-0 flex-1 items-center gap-2 rounded-md py-2 pl-2 pr-1.5 text-left"
-                        aria-expanded={!collapsed}
-                      >
-                        <ChevronRight
-                          className={`h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform ${
-                            collapsed ? "" : "rotate-90"
-                          }`}
-                          aria-hidden
-                        />
-                        {collapsed ? (
-                          <Folder
-                            className="h-3.5 w-3.5 shrink-0 text-muted-foreground/70"
-                            aria-hidden
-                          />
-                        ) : (
-                          <FolderOpen
-                            className="h-3.5 w-3.5 shrink-0 text-muted-foreground/70"
-                            aria-hidden
-                          />
-                        )}
-                        <span className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground/80">
-                          {folder.name}
-                        </span>
-                        <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
-                          {items.length}
-                        </span>
-                      </button>
-                      <FolderMenu
-                        onNewFile={onCreateFile ? () => onCreateFile(folder.id) : undefined}
-                        onNewMermaid={
-                          onCreateMermaid ? () => onCreateMermaid(folder.id) : undefined
-                        }
-                        onNewBoard={onCreateBoard ? () => onCreateBoard(folder.id) : undefined}
-                        onNewFolder={onCreateFolder ? promptNewFolder : undefined}
-                        onRename={
-                          onRenameFolder
-                            ? () => {
-                                const next = window.prompt("Rename folder to:", folder.name);
-                                if (next && next.trim() && next.trim() !== folder.name) {
-                                  onRenameFolder(folder.id, next.trim());
-                                }
-                              }
-                            : undefined
-                        }
-                        onDelete={
-                          onDeleteFolder
-                            ? () => {
-                                if (
-                                  items.length === 0 ||
-                                  window.confirm(
-                                    `Delete "${folder.name}"? Its ${items.length} file${
-                                      items.length > 1 ? "s" : ""
-                                    } move back to the top level.`,
-                                  )
-                                ) {
-                                  onDeleteFolder(folder.id);
-                                }
-                              }
-                            : undefined
-                        }
-                      />
-                    </div>
-                    {!collapsed && (
-                      <div className="ml-4 border-l border-border pl-1">
-                        {items.length === 0 ? (
-                          <p className="px-2 py-2 text-xs text-muted-foreground">
-                            Empty — drag a file here.
-                          </p>
-                        ) : (
-                          items.map(renderFileRow)
-                        )}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            <div {...(showFolders ? dropTargetProps(null) : {})}>
+            {showFolders && rootFolders.map((folder) => renderFolder(folder, 0))}
+            {/* The top level's own drop target, and the reason a file can be
+                dragged back out of a folder: it wraps the unfiled list *and*
+                the empty space below it, so the gap under the last row is a
+                real place to drop rather than dead pixels. */}
+            <div
+              className={`min-h-16 rounded-lg ${
+                // Only while something is actually being dragged. This used to
+                // test `dropFolderId === null`, which is the *resting* state —
+                // so the ring was drawn permanently, reading as a stray border
+                // around the unfiled files.
+                showFolders && draggingFileId !== null && dropFolderId === null
+                  ? "ring-2 ring-primary/60"
+                  : ""
+              }`}
+              {...(showFolders ? dropTargetProps(null) : {})}
+            >
               {groups.map((groupItem) => (
                 <div key={groupItem.label || "__all"} className={groupItem.label ? "mb-3" : ""}>
                   {groupItem.label && (
@@ -978,6 +1124,17 @@ function SidebarImpl({
       </nav>
 
       <div className="flex flex-col gap-1 border-t border-sidebar-border p-2">
+        {/* Saved sits with the workspace controls rather than in the view menu:
+            it is a place the reader goes, not a way of looking at this list. */}
+        {onOpenSavedPage && (
+          <button
+            onClick={onOpenSavedPage}
+            className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm text-foreground/80 transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <Star className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
+            <span className="min-w-0 flex-1 truncate">Saved</span>
+          </button>
+        )}
         {onSwitchWorkspace && (
           <WorkspaceMenu
             variant="sidebar"
@@ -1004,17 +1161,15 @@ export const Sidebar = memo(SidebarImpl);
 
 function GroupActionMenu({
   onShare,
-  onArchive,
+  onMoveToBin,
   onDownload,
-  onDelete,
   onCancel,
   onSelectAll,
   allSelected,
 }: {
   onShare?: () => void;
-  onArchive?: () => void;
+  onMoveToBin: () => void;
   onDownload?: () => void;
-  onDelete: () => void;
   onCancel: () => void;
   onSelectAll: () => void;
   allSelected: boolean;
@@ -1094,29 +1249,18 @@ function GroupActionMenu({
               Download Selected
             </button>
           )}
-          {onArchive && (
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                setOpen(false);
-                onArchive();
-              }}
-              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-sm text-foreground hover:bg-accent"
-            >
-              <Archive className="h-3 w-3" />
-              Archive Selected
-            </button>
-          )}
+          {/* One removal, not two. Binning is reversible for thirty days, so
+              there is no separate "delete" to offer beside it. */}
           <button
             onClick={(e) => {
               e.stopPropagation();
               setOpen(false);
-              onDelete();
+              onMoveToBin();
             }}
             className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-sm text-destructive hover:bg-accent/50"
           >
             <Trash2 className="h-3 w-3" />
-            Delete Selected
+            Move Selected to Bin
           </button>
           <div className="my-1 h-px bg-border" />
           <button
@@ -1136,47 +1280,60 @@ function GroupActionMenu({
 }
 
 function FileMenu({
-  onToggleStar,
-  isStarred,
   onEdit,
   onRename,
-  onDelete,
+  onMoveToBin,
   folders = [],
   currentFolderId = null,
   onMoveToFolder,
-  onArchive,
+  onAddToSplit,
+  alreadyInSplit,
   onDownload,
   onShare,
-  onShowHighlights,
   reordering,
   onToggleReorder,
   onSelectMode,
 }: {
-  /** Star / unstar this document. */
-  onToggleStar?: () => void;
-  isStarred?: boolean;
+  /** Show this document in a column of its own, beside what is being read. */
+  onAddToSplit?: () => void;
+  /** Already has a column — the item says so rather than offering it twice. */
+  alreadyInSplit?: boolean;
   /** Open this document in the editor. Absent for non-editable file types. */
   onEdit?: () => void;
   onRename: () => void;
-  onDelete: () => void;
+  /**
+   * Send the document to the Bin. Recoverable for 30 days, which is why this
+   * replaced both "Archive" and "Delete" — two ways to make a file go away,
+   * neither of which was reversible in an obvious place.
+   */
+  onMoveToBin: () => void;
   folders?: SidebarFolder[];
   currentFolderId?: string | null;
   onMoveToFolder?: (folderId: string | null) => void;
-  onArchive?: () => void;
   onDownload?: () => void;
   onShare?: () => void;
-  onShowHighlights?: () => void;
   reordering?: boolean;
   onToggleReorder?: () => void;
   onSelectMode?: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  // Which nested list is unfolded inside the menu: "New" or "Move to".
-  const [submenu, setSubmenu] = useState<"new" | "move" | null>(null);
+  // Which flyout is open beside the menu, and the row it hangs off.
+  const [submenu, setSubmenu] = useState<"move" | "export" | null>(null);
+  const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
 
+  // Opening one flyout closes the other, and both close with the menu.
+  const openFlyout = (which: "move" | "export") => (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setAnchor(e.currentTarget as HTMLElement);
+    setSubmenu((sub) => (sub === which ? null : which));
+  };
+
   useEffect(() => {
-    if (!open) setSubmenu(null);
+    if (!open) {
+      setSubmenu(null);
+      setAnchor(null);
+    }
   }, [open]);
 
   useEffect(() => {
@@ -1207,26 +1364,15 @@ function FileMenu({
       </button>
       {open && (
         <MenuPanel>
-          {/* What you do with the document as an object. */}
-          {onShare && (
+          {/* Working on the document itself. */}
+          {onEdit && (
             <MenuItem
-              icon={Share2}
-              label="Share link"
+              icon={SquarePen}
+              label="Edit"
               onClick={(e) => {
                 e.stopPropagation();
                 setOpen(false);
-                onShare();
-              }}
-            />
-          )}
-          {onDownload && (
-            <MenuItem
-              icon={Download}
-              label="Download"
-              onClick={(e) => {
-                e.stopPropagation();
-                setOpen(false);
-                onDownload();
+                onEdit();
               }}
             />
           )}
@@ -1239,70 +1385,45 @@ function FileMenu({
               onRename();
             }}
           />
-          {onEdit && (
+          {onAddToSplit && (
             <MenuItem
-              icon={SquarePen}
-              label="Edit"
+              icon={Columns2}
+              label={alreadyInSplit ? "Already in split view" : "Add to split view"}
+              disabled={alreadyInSplit}
               onClick={(e) => {
                 e.stopPropagation();
                 setOpen(false);
-                onEdit();
+                onAddToSplit();
               }}
+            />
+          )}
+          {onMoveToFolder && folders.length > 0 && (
+            <MenuItem
+              icon={FolderInput}
+              label="Move to folder"
+              onClick={openFlyout("move")}
+              trailing={<ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />}
             />
           )}
 
-          <MenuSeparator />
+          {/* Getting the document out of the app. Share and Download were two
+              rows saying the same thing — "a copy, elsewhere" — so they share
+              one flyout instead of two slots in the top-level list. */}
+          {(onShare || onDownload) && (
+            <>
+              <MenuSeparator />
+              <MenuItem
+                icon={Upload}
+                label="Export"
+                onClick={openFlyout("export")}
+                trailing={<ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />}
+              />
+            </>
+          )}
 
-          {/* State you put the document into — and finally removing it. */}
-          {onToggleStar && (
-            <MenuItem
-              icon={Star}
-              iconClassName={isStarred ? "fill-gold text-gold" : ""}
-              label={isStarred ? "Unstar" : "Star"}
-              onClick={(e) => {
-                e.stopPropagation();
-                setOpen(false);
-                onToggleStar();
-              }}
-            />
-          )}
-          {onShowHighlights && (
-            <MenuItem
-              icon={Highlighter}
-              label="See highlights"
-              onClick={(e) => {
-                e.stopPropagation();
-                setOpen(false);
-                onShowHighlights();
-              }}
-            />
-          )}
-          {onArchive && (
-            <MenuItem
-              icon={Archive}
-              label="Archive"
-              onClick={(e) => {
-                e.stopPropagation();
-                setOpen(false);
-                onArchive();
-              }}
-            />
-          )}
-          <MenuItem
-            icon={Trash2}
-            label="Delete"
-            destructive
-            onClick={(e) => {
-              e.stopPropagation();
-              setOpen(false);
-              onDelete();
-            }}
-          />
-
-          {/* How the list behaves, and where this file sits in it. */}
-          {(onToggleReorder || onSelectMode || (onMoveToFolder && folders.length > 0)) && (
-            <MenuSeparator />
-          )}
+          {/* How the list behaves — not about this document at all, so it sits
+              apart from the rows that are. */}
+          {(onToggleReorder || onSelectMode) && <MenuSeparator />}
           {onToggleReorder && (
             <MenuItem
               icon={reordering ? Check : GripVertical}
@@ -1325,53 +1446,74 @@ function FileMenu({
               }}
             />
           )}
-          {onMoveToFolder && folders.length > 0 && (
-            <>
-              <MenuItem
-                icon={FolderInput}
-                label="Move to folder"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setSubmenu((sub) => (sub === "move" ? null : "move"));
-                }}
-                trailing={
-                  <ChevronRight
-                    className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${
-                      submenu === "move" ? "rotate-90" : ""
-                    }`}
-                  />
-                }
-              />
-              {submenu === "move" && (
-                <div className="ml-3 max-h-52 overflow-y-auto border-l border-border pl-1">
-                  <MenuItem
-                    icon={FileText}
-                    label="Top level"
-                    disabled={currentFolderId === null}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setOpen(false);
-                      onMoveToFolder(null);
-                    }}
-                  />
-                  {folders.map((folder) => (
-                    <MenuItem
-                      key={folder.id}
-                      icon={Folder}
-                      label={folder.name}
-                      disabled={currentFolderId === folder.id}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setOpen(false);
-                        onMoveToFolder(folder.id);
-                      }}
-                    />
-                  ))}
-                </div>
-              )}
-            </>
-          )}
+
+          <MenuSeparator />
+          <MenuItem
+            icon={Trash2}
+            label="Move to Bin"
+            destructive
+            onClick={(e) => {
+              e.stopPropagation();
+              setOpen(false);
+              onMoveToBin();
+            }}
+          />
         </MenuPanel>
+      )}
+
+      {open && submenu === "move" && onMoveToFolder && (
+        <MenuFlyout anchor={anchor}>
+          <MenuItem
+            icon={FileText}
+            label="Top level"
+            disabled={currentFolderId === null}
+            onClick={(e) => {
+              e.stopPropagation();
+              setOpen(false);
+              onMoveToFolder(null);
+            }}
+          />
+          {folders.map((folder) => (
+            <MenuItem
+              key={folder.id}
+              icon={Folder}
+              label={folder.name}
+              disabled={currentFolderId === folder.id}
+              onClick={(e) => {
+                e.stopPropagation();
+                setOpen(false);
+                onMoveToFolder(folder.id);
+              }}
+            />
+          ))}
+        </MenuFlyout>
+      )}
+
+      {open && submenu === "export" && (
+        <MenuFlyout anchor={anchor}>
+          {onShare && (
+            <MenuItem
+              icon={Share2}
+              label="Share link"
+              onClick={(e) => {
+                e.stopPropagation();
+                setOpen(false);
+                onShare();
+              }}
+            />
+          )}
+          {onDownload && (
+            <MenuItem
+              icon={Download}
+              label="Download"
+              onClick={(e) => {
+                e.stopPropagation();
+                setOpen(false);
+                onDownload();
+              }}
+            />
+          )}
+        </MenuFlyout>
       )}
     </div>
   );
@@ -1421,6 +1563,75 @@ function MenuItem({
 /** Divider between groups of menu items. */
 function MenuSeparator() {
   return <div className="my-1 h-px bg-border" />;
+}
+
+/**
+ * A nested list that opens *beside* its parent menu rather than inside it.
+ *
+ * The folder list and the export actions used to unfold in place, pushing the
+ * rest of the menu down and making a long list of folders scroll inside a panel
+ * that was already a popover. A second panel alongside the first is how a menu
+ * of menus behaves everywhere else, and it leaves the parent's own rows where
+ * the reader left them.
+ *
+ * Positioned against the parent row: opening to the right, flipping to the left
+ * when that would run off-screen, and pulled up when it would overhang the
+ * bottom.
+ */
+function MenuFlyout({
+  anchor,
+  children,
+}: {
+  anchor: HTMLElement | null;
+  children: React.ReactNode;
+}) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+
+  useLayoutEffect(() => {
+    const place = () => {
+      if (!anchor) return;
+      const box = anchor.getBoundingClientRect();
+      let left = box.right + MENU_GAP;
+      if (left + MENU_WIDTH > window.innerWidth - VIEWPORT_MARGIN) {
+        left = box.left - MENU_WIDTH - MENU_GAP;
+      }
+      if (left < VIEWPORT_MARGIN) left = VIEWPORT_MARGIN;
+
+      const height = panelRef.current?.offsetHeight ?? 0;
+      let top = box.top;
+      if (height && top + height > window.innerHeight - VIEWPORT_MARGIN) {
+        top = Math.max(VIEWPORT_MARGIN, window.innerHeight - VIEWPORT_MARGIN - height);
+      }
+      setPos({ top, left });
+    };
+    place();
+    window.addEventListener("scroll", place, true);
+    window.addEventListener("resize", place);
+    return () => {
+      window.removeEventListener("scroll", place, true);
+      window.removeEventListener("resize", place);
+    };
+  }, [anchor, children]);
+
+  if (typeof document === "undefined") return null;
+  return createPortal(
+    <div
+      ref={panelRef}
+      // Same tag as MenuPanel: the click-away handler treats a click in here as
+      // inside the menu, not outside it.
+      data-sidebar-menu-panel
+      className="fixed z-(--z-menu) max-h-[min(60vh,22rem)] w-56 overflow-y-auto rounded-xl border border-border bg-popover p-1.5 shadow-xl"
+      style={{
+        top: pos?.top ?? 0,
+        left: pos?.left ?? 0,
+        visibility: pos ? "visible" : "hidden",
+      }}
+    >
+      {children}
+    </div>,
+    document.body,
+  );
 }
 
 /** Shared shell for the sidebar's popover menus. */
@@ -1593,16 +1804,6 @@ export function AddMenu({
               }}
             />
           )}
-          {onCreateMermaid && (
-            <MenuItem
-              icon={Workflow}
-              label="New Mermaid animation"
-              onClick={() => {
-                setOpen(false);
-                onCreateMermaid();
-              }}
-            />
-          )}
           {onCreateBoard && (
             <MenuItem
               icon={PenTool}
@@ -1701,10 +1902,9 @@ function FolderMenu({
       {open && (
         <MenuPanel>
           {onNewFile && item("New File here", FilePlus, onNewFile)}
-          {onNewMermaid && item("New Mermaid here", Workflow, onNewMermaid)}
           {onNewBoard && item("New Board here", PenTool, onNewBoard)}
           {onNewFolder && item("New Folder", FolderPlus, onNewFolder)}
-          {(onNewFile || onNewMermaid || onNewBoard || onNewFolder) && (onRename || onDelete) && (
+          {(onNewFile || onNewBoard || onNewFolder) && (onRename || onDelete) && (
             <div className="my-1 h-px bg-border" />
           )}
           {onRename && item("Rename folder", Pencil, onRename)}

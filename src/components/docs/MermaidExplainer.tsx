@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, LoaderCircle, Pause, Play, RotateCcw } from "lucide-react";
 import { readGraph } from "@/lib/explainer/graph";
-import { planExplainer } from "@/lib/explainer/plan";
+import { canExplain, planExplainer } from "@/lib/explainer/plan";
 import { applySemantics } from "@/lib/explainer/semantics";
-import { largeDiagramMermaidConfig } from "./mermaid-config";
-import { clearRenderArtifacts, describeRenderError } from "./render-error";
+import { renderMermaid } from "./mermaid-render-cache";
+import { describeRenderError } from "./render-error";
 import { ExplainerPlayer, type PlayerState } from "@/lib/explainer/player";
 import { Tray, TrayButton } from "./Mermaid";
 import {
@@ -84,21 +84,13 @@ export function MermaidExplainer({
     let disposed = false;
     setLoading(true);
     onError(null);
-    // Declared out here so the failure path can clean up after the same id.
-    // A unique id per render: Mermaid namespaces its marker defs by id, and
-    // two diagrams sharing one would have the second steal the first's
-    // arrowheads.
-    const id = `explainer-${Math.random().toString(36).slice(2, 10)}`;
 
     const run = async () => {
       try {
-        const { default: mermaid } = await import("mermaid");
-        mermaid.initialize({
-          startOnLoad: false,
-          theme: dark ? "dark" : "default",
-          ...largeDiagramMermaidConfig(),
-        });
-        const { svg } = await mermaid.render(id, code);
+        // Shared with the static stage and with the fullscreen copy of this
+        // one, so switching modes or opening fullscreen reuses the render
+        // instead of laying the diagram out again.
+        const { svg } = await renderMermaid(code, dark, false);
         if (disposed) return;
 
         host.innerHTML = svg;
@@ -123,8 +115,10 @@ export function MermaidExplainer({
         }
 
         const graph = readGraph(svgEl as SVGSVGElement);
-        if (!graph) {
-          // Nothing to sequence. The static render stays on screen and the
+        if (!graph || !canExplain(graph)) {
+          // Nothing to sequence — or so much to sequence that stepping through
+          // it would take an hour and cost more than the reader's tab can
+          // afford. Either way the static render stays on screen and the
           // caller is told, so it can drop the transport rather than offering
           // controls that do nothing.
           setLoading(false);
@@ -139,7 +133,6 @@ export function MermaidExplainer({
         setLoading(false);
         player.play();
       } catch (error) {
-        clearRenderArtifacts(id);
         if (disposed) return;
         setLoading(false);
         onError(describeRenderError(error));

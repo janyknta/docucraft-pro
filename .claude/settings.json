@@ -26,7 +26,16 @@
       "Bash(grep -E \"explainer-demo|__probe|__vis|\\\\.md$\")",
       "Bash(perl -pi -e 's/\\\\]\\\\s*>\\\\s*\\(rect|polygon|circle|ellipse|path\\)/] $1/g' src/components/docs/diagram-colors.css)",
       "Bash(grep -rn \"Copy</\\\\|> Copy\\\\|Copy$\" src/components/docs/MarkdownViewer.tsx)",
-      "Bash(grep -rn \"scroll-mt\\\\|scrollIntoView\\\\|hashchange\\\\|#\\\\${\\\\|location.hash\" src/components/docs/MarkdownViewer.tsx src/components/docs/DocsApp.tsx)"
+      "Bash(grep -rn \"scroll-mt\\\\|scrollIntoView\\\\|hashchange\\\\|#\\\\${\\\\|location.hash\" src/components/docs/MarkdownViewer.tsx src/components/docs/DocsApp.tsx)",
+      "Bash(pkill -f \"vite-node src/__gate_probe\")",
+      "Bash(npx --yes esbuild --version)",
+      "Bash(node -e \"const p=require\\('./package.json'\\);console.log\\(JSON.stringify\\(p.scripts,null,1\\)\\);console.log\\('vitest:',!!\\(p.devDependencies?.vitest||p.dependencies?.vitest\\)\\);\")",
+      "Bash(sed -i '' '1s|.*|import * as md from \"/Users/janardhan_ykunta/Util-Projects/localdox/docucraft-pro/src/lib/markdown-format\";|' t.ts)",
+      "Bash(npx tsx *)",
+      "Bash(awk 'NR>=280 && NR<=380 && /^\\(export \\)?function |^}/{print NR\": \"$0}' src/components/docs/SettingsPage.tsx)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:5199/)",
+      "Bash(echo \"tsc_exit=$?\")",
+      "Bash(curl -s -o /dev/null -w \"port5199=%{http_code}\" --max-time 2 http://localhost:5199/)"
     ],
     "additionalDirectories": [
       "/System/Library/Fonts"

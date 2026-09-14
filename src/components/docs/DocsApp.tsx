@@ -1,4 +1,4 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import {
   BookOpen,
@@ -22,6 +22,18 @@ import {
 } from "@/hooks/use-nav-history";
 import { Sidebar, AddMenu, DEFAULT_VIEW, type SidebarView } from "./Sidebar";
 import { MarkdownViewer } from "./MarkdownViewer";
+import { PaneDocument } from "./PaneDocument";
+import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
+import {
+  activeFileOf,
+  closeTab,
+  hydratePanes,
+  openInPane,
+  singlePane,
+  splitPane,
+  toPersisted,
+  type PaneLayout,
+} from "@/lib/panes";
 import { WorkspaceMenu } from "./WorkspaceMenu";
 import { WorkspaceSheet } from "./WorkspaceSheet";
 import type { AskAiPrefill } from "./ai/AskAiPanel";
@@ -38,6 +50,17 @@ const DocumentViewer = lazy(() =>
 const CommandPalette = lazy(() =>
   import("./CommandPalette").then((m) => ({ default: m.CommandPalette })),
 );
+/**
+ * How many columns the split view will go to.
+ *
+ * Not a design preference — a legibility floor. Past this, on any ordinary
+ * display, a column is narrower than a line of prose wants to be. A wide
+ * monitor comfortably carries four.
+ */
+const MAX_PANES = 4;
+
+const SavedPage = lazy(() => import("./SavedPage").then((m) => ({ default: m.SavedPage })));
+
 const SettingsPage = lazy(() =>
   import("./SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
@@ -46,20 +69,19 @@ const SettingsPage = lazy(() =>
  *  opens the dialog. DocsApp is the route component, so it remounts on the way
  *  to /settings and nothing held inside it survives to be read at mount. */
 let pendingSettingsTab: "workspace" | undefined;
-const HighlightsOnlyModal = lazy(() =>
-  import("./HighlightsOnlyModal").then((m) => ({ default: m.HighlightsOnlyModal })),
-);
 const AskAiPanel = lazy(() => import("./ai/AskAiPanel").then((m) => ({ default: m.AskAiPanel })));
 const SharedFilesDialog = lazy(() =>
   import("./SharedFilesDialog").then((m) => ({ default: m.SharedFilesDialog })),
 );
 import type { MdFile, MdChunk } from "@/lib/markdown-utils";
 import type { Highlight } from "@/lib/dom-highlighter";
+import { isBinExpired } from "@/lib/persistence";
 import { fileSubtopics, readingMinutes } from "@/lib/markdown-utils";
 import { getDocumentKind, importDocumentFile, SUPPORTED_ACCEPT } from "@/lib/document-utils";
 import { clearArtifactResolutionCache } from "@/lib/workspace-artifacts";
 import { loadReadingFont, warmAppFonts } from "@/lib/fonts";
 import { restoreCustomFont } from "@/lib/custom-font";
+import { loadGoogleFont } from "@/lib/google-font";
 import { warmMarkdownPlugins } from "@/lib/markdown-plugins";
 import { toast } from "sonner";
 import { useHistory } from "@/hooks/use-history";
@@ -250,7 +272,96 @@ export function DocsApp() {
   // which one it sits in, so folders can appear and disappear without touching
   // the documents themselves.
   const [folders, setFolders] = useState<FolderRecord[]>([]);
-  const [activeFileId, setActiveFileId] = useState<string | null>(null);
+  /**
+   * The split layout. Panes own their tabs; the app's single "active file" is
+   * derived from whichever pane has focus.
+   *
+   * Deriving it rather than storing it separately is what keeps this change
+   * small: the sidebar, the command palette, stars, the nav trail and the
+   * persistence snapshot all still read one `activeFileId`, and none of them
+   * has to learn what a pane is. `setActiveFileId` survives as a shim that
+   * opens the file in the focused pane, so every existing caller is unchanged.
+   */
+  const [paneLayout, setPaneLayout] = useState<PaneLayout>(() => singlePane(null));
+  const activeFileId = activeFileOf(paneLayout);
+  const setActiveFileId = useCallback((fileId: string | null) => {
+    setPaneLayout((layout) => {
+      if (fileId === null) {
+        // Closing the last document rather than opening one: clear the focused
+        // pane's selection without disturbing the other panes' tabs.
+        return {
+          ...layout,
+          panes: layout.panes.map((pane) =>
+            pane.id === layout.focusedPaneId ? { ...pane, activeTabId: null } : pane,
+          ),
+        };
+      }
+      return openInPane(layout, fileId);
+    });
+  }, []);
+
+  // `markDirty` is declared much further down, after the persistence machinery
+  // it belongs to. These callbacks sit up here with the pane state they act on,
+  // so they reach it through a ref rather than forcing either block to move.
+  const markDirtyRef = useRef<() => void>(() => {});
+
+  /** Which pane the reader is working in — clicking anywhere in one focuses it. */
+  const focusPane = useCallback((paneId: string) => {
+    setPaneLayout((layout) =>
+      layout.focusedPaneId === paneId ? layout : { ...layout, focusedPaneId: paneId },
+    );
+  }, []);
+
+  /** What the side-by-side columns are showing, other than the focused one. */
+  const splitFileIds = useMemo(
+    () =>
+      paneLayout.panes
+        .filter((pane) => pane.id !== paneLayout.focusedPaneId)
+        .map((pane) => pane.activeTabId)
+        .filter((id): id is string => !!id),
+    [paneLayout],
+  );
+
+  /** Put a document in a column beside the one being read. */
+  const openBeside = useCallback((fileId: string) => {
+    setPaneLayout((layout) => {
+      const from = layout.focusedPaneId ?? layout.panes[0]?.id;
+      if (!from) return openInPane(layout, fileId);
+      // Already in a column of its own: focus that one rather than opening a
+      // second copy of the same document.
+      const existing = layout.panes.find((pane) => pane.id !== from && pane.tabs.includes(fileId));
+      if (existing) return openInPane(layout, fileId, existing.id);
+      // Otherwise a new column. There is no two-column cap: on a wide display
+      // comparing four documents is the whole point. The ceiling is only what
+      // stays legible — below roughly this width a column is no longer reading,
+      // it is a sliver.
+      if (layout.panes.length >= MAX_PANES) {
+        const last = layout.panes[layout.panes.length - 1];
+        return openInPane(layout, fileId, last.id);
+      }
+      return splitPane(layout, from, fileId);
+    });
+    markDirtyRef.current();
+  }, []);
+
+  /**
+   * Close a whole pane, folding its documents back into the one beside it.
+   *
+   * The documents themselves stay open — they are listed in the sidebar, not
+   * owned by the pane — so closing a column is only ever about the layout.
+   */
+  const closePane = useCallback((paneId: string) => {
+    setPaneLayout((layout) => {
+      if (layout.panes.length <= 1) return layout;
+      const panes = layout.panes.filter((pane) => pane.id !== paneId);
+      const focusedPaneId = panes.some((p) => p.id === layout.focusedPaneId)
+        ? layout.focusedPaneId
+        : panes[0].id;
+      return { panes, focusedPaneId };
+    });
+    markDirtyRef.current();
+  }, []);
+
   // A just-created blank document: the viewer opens straight into its editor so
   // the reader can paste markdown in without hunting for the Edit button.
   const [autoEditFileId, setAutoEditFileId] = useState<string | null>(null);
@@ -260,6 +371,7 @@ export function DocsApp() {
   const [theme, setTheme] = useState<Theme>(() => loadPrefs().theme);
   const [readingMode, setReadingMode] = useState<ReadingMode>(() => loadPrefs().readingMode);
   const [readingFont, setReadingFont] = useState<ReadingFont>(() => loadPrefs().readingFont);
+  const [googleFont, setGoogleFont] = useState<string | null>(() => loadPrefs().googleFont);
   const [diagramColors, setDiagramColors] = useState<boolean>(() => loadPrefs().diagramColors);
   const [aiEnabled, setAiEnabled] = useState<boolean>(() => loadPrefs().aiEnabled);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -296,7 +408,6 @@ export function DocsApp() {
   } = useHistory<Highlight[]>([]);
   // File whose highlights are shown in isolation via the "Show highlights only"
   // menu item; null when the modal is closed.
-  const [highlightsOnlyFileId, setHighlightsOnlyFileId] = useState<string | null>(null);
   // Files arriving from a `#share-files=` link, held until the reader picks
   // between a new workspace and the one they already have open.
   const [incomingShare, setIncomingShare] = useState<SharedFilesPayload | null>(null);
@@ -312,6 +423,10 @@ export function DocsApp() {
   const location = useLocation();
   const navigate = useNavigate();
   const showSettings = location.pathname === "/settings";
+  // Saved is a page of its own rather than a tab inside settings: it is
+  // something the reader comes back to and reads, not a preference they set
+  // once. Settings keeps only the clear-everything control.
+  const showSaved = location.pathname === "/saved";
 
   // Navigation history. Owned here because this is where every destination —
   // the route, the open file, the section, the search term — actually lives.
@@ -344,6 +459,7 @@ export function DocsApp() {
     files,
     folders,
     activeFileId,
+    paneLayout,
     expanded,
     sidebarCollapsed,
     saved,
@@ -354,6 +470,7 @@ export function DocsApp() {
     files,
     folders,
     activeFileId,
+    paneLayout,
     expanded,
     sidebarCollapsed,
     saved,
@@ -509,6 +626,22 @@ export function DocsApp() {
     };
   }, []);
 
+  // A Google family is only a stored *name*, so the stylesheet has to be
+  // re-requested on every boot before `[data-font="google"]` can resolve it.
+  // A family that no longer loads (offline, renamed upstream) falls back rather
+  // than leaving the reader on a face that never arrives.
+  useEffect(() => {
+    if (!googleFont) return;
+    let cancelled = false;
+    void loadGoogleFont(googleFont).catch(() => {
+      if (cancelled) return;
+      setReadingFont((current) => (current === "google" ? "hyperlegible" : current));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [googleFont]);
+
   // Inter backs the app chrome, and syntax highlighting / math typesetting back
   // most documents. All three are requested off the critical path: the first
   // paint runs on system fonts and unhighlighted code, and each upgrade lands
@@ -576,6 +709,10 @@ export function DocsApp() {
     savePrefs({ readingFont });
   }, [readingFont]);
 
+  useEffect(() => {
+    savePrefs({ googleFont });
+  }, [googleFont]);
+
   // ---- persistence core ----
 
   const buildRecord = useCallback((): WorkspaceRecord => {
@@ -609,6 +746,8 @@ export function DocsApp() {
         scrollTop: scrollRef.current,
         fileOrder: s.files.map((f) => f.id),
         recentFileIds: s.recentFileIds,
+        panes: toPersisted(s.paneLayout),
+        focusedPaneId: s.paneLayout.focusedPaneId,
       },
     };
   }, []);
@@ -649,6 +788,9 @@ export function DocsApp() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => void persistNow(false), 700);
   }, [persistNow]);
+  // Published for the pane callbacks, which are declared above this point and
+  // would otherwise have to close over a variable that does not exist yet.
+  markDirtyRef.current = markDirty;
 
   const hydrateWorkspace = useCallback(
     (ws: WorkspaceRecord) => {
@@ -674,10 +816,25 @@ export function DocsApp() {
         });
       }
 
-      setFiles(parsed);
+      // Sweep the Bin on the way in. There is no background process in a
+      // local-first app, so "deletes after 30 days" means the next time the
+      // workspace is opened past that mark — which is also the only moment the
+      // reader could have noticed it still being there.
+      const swept = parsed.filter((f) => !isBinExpired(f.deletedAt));
+      setFiles(swept);
       setFolders(wsFolders);
       setAutoEditFileId(null);
-      setActiveFileId(ws.ui?.activeFileId ?? parsed[0]?.id ?? null);
+      // Panes come back with the workspace. A record written before panes
+      // existed has none, which hydrates as a single pane holding whatever was
+      // open — so an older workspace opens exactly as it used to.
+      setPaneLayout(
+        hydratePanes(
+          ws.ui?.panes,
+          ws.ui?.focusedPaneId,
+          new Set(swept.map((f) => f.id)),
+          ws.ui?.activeFileId ?? swept[0]?.id ?? null,
+        ),
+      );
       setRecentFileIds(ws.ui?.recentFileIds ?? []);
       setExpanded(ws.ui?.expanded ?? {});
       setSidebarCollapsed(!!ws.ui?.sidebarCollapsed);
@@ -1033,8 +1190,24 @@ export function DocsApp() {
   const pathnameRef = useRef(location.pathname);
   pathnameRef.current = location.pathname;
 
+  /**
+   * Whether the open editor holds unsaved changes, reported by the viewer.
+   *
+   * Navigation asks this before it moves. Only a genuinely changed draft
+   * prompts — leaving an untouched editor stays silent, which is what keeps the
+   * prompt meaningful when it does appear.
+   */
+  const editorDirtyRef = useRef(false);
+  const confirmDiscardDraft = useCallback((fileId?: string) => {
+    // Re-opening the document already on screen is not leaving it.
+    if (!editorDirtyRef.current) return true;
+    if (fileId && fileId === activeFileIdRef.current) return true;
+    return window.confirm("This document has unsaved changes. Leave and discard them?");
+  }, []);
+
   const handleSelect = useCallback(
     (fileId: string, headingId?: string, query?: string) => {
+      if (!confirmDiscardDraft(fileId)) return;
       setActiveFileId(fileId);
       if (query !== undefined) setHighlightQuery(query || null);
 
@@ -1104,13 +1277,43 @@ export function DocsApp() {
     [markDirty],
   );
 
-  const toggleArchiveFile = useCallback(
+  /**
+   * Send a document to the Bin, or bring it back.
+   *
+   * This replaced a separate Archive and Delete. Two ways to make a file
+   * disappear, one of them irreversible and the other easy to mistake for it,
+   * is one way too many: binning is the single gesture, and it is undoable for
+   * thirty days from a place the reader can actually find.
+   */
+  const moveToBin = useCallback(
     (id: string) => {
-      setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, isArchived: !f.isArchived } : f)));
+      setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, deletedAt: Date.now() } : f)));
       markDirty();
     },
     [markDirty],
   );
+
+  const restoreFromBin = useCallback(
+    (id: string) => {
+      setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, deletedAt: null } : f)));
+      markDirty();
+    },
+    [markDirty],
+  );
+
+  /** Delete for good — from the Bin, where the reader has already been warned. */
+  const deleteForever = useCallback(
+    (id: string) => {
+      setFiles((prev) => prev.filter((f) => f.id !== id));
+      markDirty();
+    },
+    [markDirty],
+  );
+
+  const emptyBin = useCallback(() => {
+    setFiles((prev) => prev.filter((f) => !f.deletedAt));
+    markDirty();
+  }, [markDirty]);
 
   const downloadFile = useCallback((id: string) => {
     const file = filesRef.current.find((f) => f.id === id);
@@ -1228,17 +1431,42 @@ flowchart LR
   );
 
   const createFolder = useCallback(
-    (name: string) => {
+    (name: string, parentId?: string | null) => {
       const trimmed = name.trim();
       if (!trimmed) return;
       const folder: FolderRecord = {
         id: crypto.randomUUID(),
         name: trimmed,
         createdAt: Date.now(),
+        parentId: parentId ?? null,
       };
       setFolders((prev) => [...prev, folder]);
       markDirty();
       toast.success(`Created folder "${trimmed}"`);
+    },
+    [markDirty],
+  );
+
+  /**
+   * Re-parent a folder, refusing moves that would detach a subtree.
+   *
+   * Dropping a folder onto its own descendant would leave that whole branch
+   * pointing in a loop — unreachable from the top level, and invisible in a
+   * sidebar that renders downward from the roots.
+   */
+  const moveFolderToFolder = useCallback(
+    (folderId: string, parentId: string | null) => {
+      if (folderId === parentId) return;
+      setFolders((prev) => {
+        if (parentId) {
+          const parentOf = new Map(prev.map((f) => [f.id, f.parentId ?? null]));
+          for (let at: string | null = parentId; at; at = parentOf.get(at) ?? null) {
+            if (at === folderId) return prev;
+          }
+        }
+        return prev.map((f) => (f.id === folderId ? { ...f, parentId } : f));
+      });
+      markDirty();
     },
     [markDirty],
   );
@@ -1253,10 +1481,20 @@ flowchart LR
     [markDirty],
   );
 
-  /** Deleting a folder keeps its documents — they move back to the top level. */
+  /**
+   * Deleting a folder keeps everything inside it.
+   *
+   * Its documents return to the top level, and so do any folders nested under
+   * it — re-parenting the children rather than deleting the subtree, so a
+   * mis-click never takes a branch of the workspace with it.
+   */
   const deleteFolder = useCallback(
     (id: string) => {
-      setFolders((prev) => prev.filter((f) => f.id !== id));
+      setFolders((prev) =>
+        prev
+          .filter((f) => f.id !== id)
+          .map((f) => (f.parentId === id ? { ...f, parentId: null } : f)),
+      );
       setFiles((prev) => prev.map((f) => (f.folderId === id ? { ...f, folderId: null } : f)));
       markDirty();
     },
@@ -1947,16 +2185,6 @@ flowchart LR
     if (activeFile) toggleSaved(activeFile.id, { kind: "file", title: activeFile.name });
   }, [toggleSaved, activeFile]);
 
-  // Star / unstar any document from its sidebar row, not just the open one —
-  // the header no longer carries a star.
-  const toggleFileStar = useCallback(
-    (fileId: string) => {
-      const file = filesRef.current.find((f) => f.id === fileId);
-      if (file) toggleSaved(fileId, { kind: "file", title: file.name });
-    },
-    [toggleSaved],
-  );
-
   // The collapsed rail's "New folder" — the expanded sidebar asks for the name
   // itself, so the rail has to do the same before it can create one.
   const promptNewFolderFromRail = useCallback(() => {
@@ -2036,6 +2264,13 @@ flowchart LR
     },
     [navigate],
   );
+
+  /** Open the Saved page — a real route, so it is linkable and in the trail. */
+  const openSavedPage = useCallback(() => {
+    navigate({ to: "/saved" });
+    navHistoryRef.current.push({ path: "/saved", fileId: null, headingId: null });
+    setDrawerOpen(false);
+  }, [navigate]);
 
   // Closing the dialog is a route change back to the reader. Going through the
   // trail rather than straight to "/" keeps whatever document was open, and
@@ -2124,14 +2359,6 @@ flowchart LR
       close: () => setPaletteOpen(false),
     });
   }, [paletteOpen, registerEscape]);
-  useEffect(() => {
-    if (!highlightsOnlyFileId) return;
-    return registerEscape({
-      id: "highlights-only",
-      depth: ESCAPE_DEPTH.overlay,
-      close: () => setHighlightsOnlyFileId(null),
-    });
-  }, [highlightsOnlyFileId, registerEscape]);
 
   // The browser's own back/gesture is the same intent as the header's back, so
   // it runs the same code — including closing an open mode first. `popstate`
@@ -2279,6 +2506,20 @@ flowchart LR
     </Suspense>
   ) : null;
 
+  const savedPage = showSaved ? (
+    <Suspense fallback={null}>
+      <SavedPage
+        saved={savedEntries}
+        highlights={highlights}
+        fileName={(fileId) => filesRef.current.find((f) => f.id === fileId)?.name ?? null}
+        onOpenSaved={openSaved}
+        onRemoveSaved={removeSaved}
+        onOpenHighlight={(hl) => handleSelect(hl.fileId, hl.subtopicId || undefined)}
+        onRemoveHighlight={removeHighlight}
+      />
+    </Suspense>
+  ) : null;
+
   // Settings is a dialog over the reader rather than a page of its own, so the
   // document stays visible behind it and closing it returns you to exactly what
   // you were reading. `/settings` stays a real route so the deep link still
@@ -2314,11 +2555,15 @@ flowchart LR
         onSetReadingMode={setReadingMode}
         readingFont={readingFont}
         onSetReadingFont={setReadingFont}
+        googleFont={googleFont}
+        onSetGoogleFont={setGoogleFont}
         diagramColors={diagramColors}
         onSetDiagramColors={setDiagramColors}
         aiEnabled={aiEnabled}
         onSetAiEnabled={setAiEnabled}
-        onToggleArchiveFile={toggleArchiveFile}
+        onRestoreFromBin={restoreFromBin}
+        onDeleteForever={deleteForever}
+        onEmptyBin={emptyBin}
         onImportWorkspace={importWorkspace}
         onExportWorkspace={exportWorkspace}
         onShareWorkspace={shareWorkspace}
@@ -2453,14 +2698,12 @@ flowchart LR
                 onToggleFile={toggleFile}
                 onSelect={handleSelect}
                 onAddFiles={() => inputRef.current?.click()}
-                onRemoveFile={removeFile}
-                onArchiveFile={toggleArchiveFile}
+                onRemoveFile={moveToBin}
                 onDownloadFile={downloadFile}
                 onShareFile={shareFile}
                 onShareFiles={(ids) => void shareFiles(ids)}
                 onRenameFile={renameFile}
                 onEditFile={editFile}
-                onToggleFileStar={toggleFileStar}
                 folders={folders}
                 onCreateFile={createFile}
                 onCreateMermaid={createMermaidFile}
@@ -2469,6 +2712,7 @@ flowchart LR
                 onRenameFolder={renameFolder}
                 onDeleteFolder={deleteFolder}
                 onMoveFileToFolder={moveFileToFolder}
+                onMoveFolderToFolder={moveFolderToFolder}
                 onReorderFile={reorderFile}
                 onSortByName={sortFilesByName}
                 view={sidebarView}
@@ -2489,8 +2733,12 @@ flowchart LR
                 onClearStorage={clearAllStorage}
                 highlights={highlights}
                 onRemoveHighlight={removeHighlight}
-                onShowHighlights={setHighlightsOnlyFileId}
+                onRestoreFromBin={restoreFromBin}
+                onDeleteForever={deleteForever}
                 onOpenSettings={openSettings}
+                onOpenSavedPage={openSavedPage}
+                onAddToSplit={openBeside}
+                splitFileIds={splitFileIds}
                 onAskAi={aiEnabled ? openAskAi : undefined}
                 onNewWorkspace={newWorkspace}
                 onImportWorkspace={importWorkspace}
@@ -2585,14 +2833,12 @@ flowchart LR
                     onToggleFile={toggleFile}
                     onSelect={handleSelect}
                     onAddFiles={() => inputRef.current?.click()}
-                    onRemoveFile={removeFile}
-                    onArchiveFile={toggleArchiveFile}
+                    onRemoveFile={moveToBin}
                     onDownloadFile={downloadFile}
                     onShareFile={shareFile}
                     onShareFiles={(ids) => void shareFiles(ids)}
                     onRenameFile={renameFile}
                     onEditFile={editFile}
-                    onToggleFileStar={toggleFileStar}
                     folders={folders}
                     onCreateFile={createFile}
                     onCreateMermaid={createMermaidFile}
@@ -2601,6 +2847,7 @@ flowchart LR
                     onRenameFolder={renameFolder}
                     onDeleteFolder={deleteFolder}
                     onMoveFileToFolder={moveFileToFolder}
+                    onMoveFolderToFolder={moveFolderToFolder}
                     onReorderFile={reorderFile}
                     onSortByName={sortFilesByName}
                     view={sidebarView}
@@ -2621,10 +2868,8 @@ flowchart LR
                     onClearStorage={clearAllStorage}
                     highlights={highlights}
                     onRemoveHighlight={removeHighlight}
-                    onShowHighlights={(id) => {
-                      setHighlightsOnlyFileId(id);
-                      setDrawerOpen(false);
-                    }}
+                    onRestoreFromBin={restoreFromBin}
+                    onDeleteForever={deleteForever}
                     onOpenSettings={(tab) => {
                       setDrawerOpen(false);
                       openSettings(tab);
@@ -2661,9 +2906,102 @@ flowchart LR
             binary-document viewers are code-split; the markdown viewer is not,
             so the common case never suspends here. */}
           <Suspense fallback={<main className="min-w-0 flex-1" aria-busy />}>
-            <main className="min-w-0 flex-1 pb-[max(1.5rem,env(safe-area-inset-bottom))] lg:pb-0">
-              {activeFile &&
-              (activeFile.kind === "markdown" || activeFile.kind === "text" || !activeFile.kind) ? (
+            {/* In split view the column is pinned to the viewport and each pane
+                scrolls itself. Without a real height here the group resolves
+                `h-full` against an auto-height parent, every pane grows to its
+                content, and the *window* ends up doing the scrolling — which is
+                why the panes used to move together. */}
+            <main
+              className={
+                paneLayout.panes.length > 1 && !showSaved
+                  ? "flex min-h-0 w-0 min-w-0 flex-1 flex-col overflow-hidden h-[calc(100dvh-var(--header-h,3.5rem))]"
+                  : "min-w-0 flex-1 pb-[max(1.5rem,env(safe-area-inset-bottom))] lg:pb-0"
+              }
+            >
+              {/* Saved is a page, not an overlay: it takes the content column
+                  instead of stacking on top of whatever document was open. */}
+              {showSaved ? (
+                savedPage
+              ) : paneLayout.panes.length > 1 ? (
+                /* Split view. Each pane carries its own tab strip and its own
+                   document; the focused pane is what the rest of the app means
+                   by "the active file", so nothing outside here has to know
+                   panes exist. */
+                <ResizablePanelGroup orientation="horizontal" className="h-full">
+                  {paneLayout.panes.map((pane, index) => {
+                    const paneFile = files.find((f) => f.id === pane.activeTabId) ?? null;
+                    return (
+                      <Fragment key={pane.id}>
+                        {index > 0 && <ResizableHandle withHandle />}
+                        <ResizablePanel
+                          defaultSize={`${Math.floor(100 / paneLayout.panes.length)}%`}
+                          minSize="20%"
+                        >
+                          <div
+                            onMouseDown={() => focusPane(pane.id)}
+                            className="flex h-full min-h-0 flex-col"
+                          >
+                            {/* No tab strip. The open documents live in the
+                                sidebar; a pane is just a column of reading, and
+                                the only chrome it carries is a thin header
+                                saying which document it holds and how to close
+                                it. */}
+                            <div
+                              className={`flex h-9 shrink-0 items-center gap-2 border-b px-3 ${
+                                pane.id === paneLayout.focusedPaneId
+                                  ? "border-border bg-background"
+                                  : "border-border/60 bg-muted/20"
+                              }`}
+                            >
+                              <span className="min-w-0 flex-1 truncate text-xs font-medium text-muted-foreground">
+                                {paneFile ? paneFile.name.replace(/\.[^.]+$/, "") : "Empty"}
+                              </span>
+                              <button
+                                onClick={() => closePane(pane.id)}
+                                aria-label="Close this pane"
+                                title="Close this pane"
+                                className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                              >
+                                <X className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                            <div className="min-h-0 flex-1 overflow-y-auto px-4">
+                              {paneFile ? (
+                                <PaneDocument
+                                  file={paneFile}
+                                  files={files}
+                                  saved={saved}
+                                  highlights={highlights}
+                                  workspaceId={workspaceId}
+                                  workspaceRevision={workspaceRevision}
+                                  workspaceName={workspaceNameRef.current}
+                                  onContentChange={handleContentChange}
+                                  onAddHighlight={addHighlight}
+                                  onUpdateHighlight={updateHighlight}
+                                  onRemoveHighlight={removeHighlight}
+                                  onRepairHighlights={repairHighlights}
+                                  onToggleSaved={toggleSaved}
+                                  onRemoveSaved={removeSaved}
+                                  onOpenArtifact={openEmbeddedArtifact}
+                                  readingMode={readingMode}
+                                />
+                              ) : (
+                                <p className="px-2 py-16 text-center text-sm text-muted-foreground">
+                                  Nothing open in this pane. Drag a tab here, or pick a document
+                                  from the sidebar.
+                                </p>
+                              )}
+                            </div>
+                          </div>
+                        </ResizablePanel>
+                      </Fragment>
+                    );
+                  })}
+                </ResizablePanelGroup>
+              ) : activeFile &&
+                (activeFile.kind === "markdown" ||
+                  activeFile.kind === "text" ||
+                  !activeFile.kind) ? (
                 <MarkdownViewer
                   file={activeFile}
                   prevFile={prevFile}
@@ -2672,6 +3010,9 @@ flowchart LR
                   activeSubtopicId={activeHeadingId}
                   highlightQuery={highlightQuery}
                   onContentChange={handleContentChange}
+                  onEditorDirtyChange={(dirty) => {
+                    editorDirtyRef.current = dirty;
+                  }}
                   startInEditFileId={autoEditFileId}
                   onStartInEditConsumed={consumeStartInEdit}
                   nextReadingMin={nextReadingMinutes}
@@ -2727,35 +3068,6 @@ flowchart LR
             e.target.value = "";
           }}
         />
-        {highlightsOnlyFileId &&
-          (() => {
-            const hlFile = files.find((f) => f.id === highlightsOnlyFileId);
-            if (!hlFile) return null;
-            const hlFileChunks = fileSubtopics(hlFile);
-            const chunkOrder = new Map(hlFileChunks.map((c, i) => [c.id, i]));
-            const fileHighlights = highlights
-              .filter((h) => h.fileId === hlFile.id)
-              .sort((a, b) => {
-                const aChunkIndex = chunkOrder.get(a.subtopicId ?? "") ?? -1;
-                const bChunkIndex = chunkOrder.get(b.subtopicId ?? "") ?? -1;
-                if (aChunkIndex !== bChunkIndex) return aChunkIndex - bChunkIndex;
-                return (a.start ?? 0) - (b.start ?? 0);
-              });
-            return (
-              <Suspense fallback={null}>
-                <HighlightsOnlyModal
-                  fileName={hlFile.name}
-                  highlights={fileHighlights}
-                  onClose={() => setHighlightsOnlyFileId(null)}
-                  onJump={(hl: Highlight) => {
-                    setHighlightsOnlyFileId(null);
-                    handleSelect(hl.fileId, hl.subtopicId || undefined);
-                  }}
-                  onRemove={removeHighlight}
-                />
-              </Suspense>
-            );
-          })()}
 
         {/* Mounted only once opened. The panel is a large component whose props
           are derived from every document in the workspace; keeping it out of

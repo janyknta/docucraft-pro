@@ -23,12 +23,14 @@ import {
   registerCustomFont,
   unregisterCustomFont,
 } from "@/lib/custom-font";
+import { isValidGoogleFamily, loadGoogleFont, unloadGoogleFont } from "@/lib/google-font";
 import { AiSettings } from "./ai/AiSettings";
 import { Section, Group, Row, Empty, IconButton } from "./settings/primitives";
 import { Switch } from "@/components/ui/switch";
 import type { Highlight } from "@/lib/dom-highlighter";
 import type { MdFile } from "@/lib/markdown-utils";
 import type { ThemePref, ReadingMode, ReadingFont } from "@/lib/persistence";
+import { BIN_RETENTION_MS } from "@/lib/persistence";
 import { savedTypeLabel, type SavedEntry, type SavedItem } from "@/lib/saved-items";
 import { STORAGE_QUOTA_FRACTION, formatBytes } from "@/lib/storage-limits";
 
@@ -54,11 +56,18 @@ export interface SettingsPageProps {
   onSetReadingMode: (mode: ReadingMode) => void;
   readingFont: ReadingFont;
   onSetReadingFont: (font: ReadingFont) => void;
+  googleFont: string | null;
+  onSetGoogleFont: (family: string | null) => void;
   diagramColors: boolean;
   onSetDiagramColors: (on: boolean) => void;
   aiEnabled: boolean;
   onSetAiEnabled: (on: boolean) => void;
-  onToggleArchiveFile: (id: string) => void;
+  /** Bring a binned document back into the workspace. */
+  onRestoreFromBin: (id: string) => void;
+  /** Delete one binned document for good. */
+  onDeleteForever: (id: string) => void;
+  /** Empty the Bin entirely. */
+  onEmptyBin: () => void;
   /** Workspace file actions, moved here out of the workspace menus. */
   onImportWorkspace: (file: File) => void;
   onExportWorkspace: () => void;
@@ -107,11 +116,15 @@ export function SettingsPage({
   onSetReadingMode,
   readingFont,
   onSetReadingFont,
+  googleFont,
+  onSetGoogleFont,
   diagramColors,
   onSetDiagramColors,
   aiEnabled,
   onSetAiEnabled,
-  onToggleArchiveFile,
+  onRestoreFromBin,
+  onDeleteForever,
+  onEmptyBin,
   onImportWorkspace,
   onExportWorkspace,
   onShareWorkspace,
@@ -217,6 +230,8 @@ export function SettingsPage({
                 onSetReadingMode={onSetReadingMode}
                 readingFont={readingFont}
                 onSetReadingFont={onSetReadingFont}
+                googleFont={googleFont}
+                onSetGoogleFont={onSetGoogleFont}
                 diagramColors={diagramColors}
                 onSetDiagramColors={onSetDiagramColors}
                 aiEnabled={aiEnabled}
@@ -235,6 +250,8 @@ export function SettingsPage({
                 onSetReadingMode={onSetReadingMode}
                 readingFont={readingFont}
                 onSetReadingFont={onSetReadingFont}
+                googleFont={googleFont}
+                onSetGoogleFont={onSetGoogleFont}
                 diagramColors={diagramColors}
                 onSetDiagramColors={onSetDiagramColors}
                 aiEnabled={aiEnabled}
@@ -270,10 +287,21 @@ export function SettingsPage({
                   onClearAll={onClearHighlights}
                   onNavigate={onNavigate}
                 />
-                <ArchiveSettings files={files} onUnarchive={onToggleArchiveFile} />
+                <BinSettings
+                  files={files}
+                  onRestore={onRestoreFromBin}
+                  onDeleteForever={onDeleteForever}
+                  onEmptyBin={onEmptyBin}
+                />
               </div>
             )}
-            {activeTab === "storage" && <StorageSettings onClearStorage={onClearStorage} />}
+            {activeTab === "storage" && (
+              <StorageSettings
+                onClearStorage={onClearStorage}
+                binCount={files.filter((f) => typeof f.deletedAt === "number").length}
+                onEmptyBin={onEmptyBin}
+              />
+            )}
           </div>
         </div>
       </div>
@@ -307,6 +335,8 @@ function AppearanceSettings({
   onSetReadingMode,
   readingFont,
   onSetReadingFont,
+  googleFont,
+  onSetGoogleFont,
   diagramColors,
   onSetDiagramColors,
   aiEnabled,
@@ -322,6 +352,8 @@ function AppearanceSettings({
   onSetReadingMode: (mode: ReadingMode) => void;
   readingFont: ReadingFont;
   onSetReadingFont: (font: ReadingFont) => void;
+  googleFont: string | null;
+  onSetGoogleFont: (family: string | null) => void;
 }) {
   return (
     <div className="space-y-10">
@@ -365,7 +397,12 @@ function AppearanceSettings({
         </div>
       </Section>
 
-      <ReadingFontSettings readingFont={readingFont} onSetReadingFont={onSetReadingFont} />
+      <ReadingFontSettings
+        readingFont={readingFont}
+        onSetReadingFont={onSetReadingFont}
+        googleFont={googleFont}
+        onSetGoogleFont={onSetGoogleFont}
+      />
 
       <Section title="Layout">
         <Group>
@@ -535,14 +572,58 @@ function WorkspaceSettings({
 function ReadingFontSettings({
   readingFont,
   onSetReadingFont,
+  googleFont,
+  onSetGoogleFont,
 }: {
   readingFont: ReadingFont;
   onSetReadingFont: (font: ReadingFont) => void;
+  googleFont: string | null;
+  onSetGoogleFont: (family: string | null) => void;
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [customName, setCustomName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // The family being typed, kept separate from the saved one: a half-typed
+  // name must not knock the reader's working font out from under them.
+  const [familyDraft, setFamilyDraft] = useState(googleFont ?? "");
+  const [googleBusy, setGoogleBusy] = useState(false);
+  const [googleError, setGoogleError] = useState<string | null>(null);
+
+  const applyGoogleFamily = async () => {
+    const family = familyDraft.trim();
+    if (!family) return;
+    setGoogleError(null);
+    if (!isValidGoogleFamily(family)) {
+      setGoogleError("That doesn't look like a font family name.");
+      return;
+    }
+    setGoogleBusy(true);
+    try {
+      // Prove the family exists before saving it. Google answers an unknown
+      // name with a 400, and a saved-but-broken family would leave the reader
+      // silently on the fallback stack with no clue why.
+      await loadGoogleFont(family);
+      onSetGoogleFont(family);
+      onSetReadingFont("google");
+    } catch (error) {
+      setGoogleError(
+        error instanceof Error && error.message === "Could not reach Google Fonts"
+          ? "Could not reach Google Fonts."
+          : `No family called "${family}" on Google Fonts.`,
+      );
+    } finally {
+      setGoogleBusy(false);
+    }
+  };
+
+  const removeGoogleFamily = () => {
+    unloadGoogleFont();
+    onSetGoogleFont(null);
+    setFamilyDraft("");
+    setGoogleError(null);
+    if (readingFont === "google") onSetReadingFont("hyperlegible");
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -646,6 +727,66 @@ function ReadingFontSettings({
       </Group>
 
       {error && <p className="px-1 text-xs text-destructive">{error}</p>}
+
+      {/* A family hosted by Google, named rather than uploaded. Kept below the
+          upload because it is the option with a cost attached: the face is
+          fetched from Google's servers at read time, which is the one place
+          this reader stops being entirely local. */}
+      <Group className="mt-2.5">
+        {googleFont ? (
+          <div className="flex items-center gap-2 pr-2 transition-colors hover:bg-accent/40">
+            <button
+              onClick={() => onSetReadingFont("google")}
+              aria-pressed={readingFont === "google"}
+              className="flex min-w-0 flex-1 items-center justify-between gap-4 px-4 py-3 text-left"
+            >
+              <span className="min-w-0">
+                <span
+                  className="block truncate text-base text-foreground"
+                  style={{ fontFamily: `"${googleFont}", ui-sans-serif, sans-serif` }}
+                >
+                  {googleFont}
+                </span>
+                <span className="mt-0.5 block truncate text-xs text-muted-foreground">
+                  From Google Fonts
+                </span>
+              </span>
+              {readingFont === "google" && <Check className="h-4 w-4 shrink-0 text-primary" />}
+            </button>
+            <IconButton onClick={removeGoogleFamily} label="Remove Google font" danger>
+              <Trash2 className="h-4 w-4" />
+            </IconButton>
+          </div>
+        ) : (
+          <div className="px-4 py-3">
+            <div className="text-sm text-foreground">A font from Google Fonts</div>
+            <div className="mt-0.5 text-xs text-muted-foreground">
+              Type a family name, e.g. Lora or Source Serif 4. Fetched from Google when you read.
+            </div>
+            <div className="mt-2.5 flex items-center gap-2">
+              <input
+                value={familyDraft}
+                onChange={(e) => setFamilyDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void applyGoogleFamily();
+                }}
+                placeholder="Font family"
+                spellCheck={false}
+                className="min-w-0 flex-1 rounded-md border border-border bg-background px-2.5 py-1.5 text-sm outline-none focus:border-primary/60 focus:ring-2 focus:ring-primary/10"
+              />
+              <button
+                onClick={() => void applyGoogleFamily()}
+                disabled={googleBusy || !familyDraft.trim()}
+                className="shrink-0 rounded-md px-3 py-1.5 text-sm font-medium text-primary transition-colors hover:bg-primary/10 disabled:opacity-50"
+              >
+                {googleBusy ? "Loading…" : "Use"}
+              </button>
+            </div>
+          </div>
+        )}
+      </Group>
+
+      {googleError && <p className="px-1 text-xs text-destructive">{googleError}</p>}
 
       <input
         ref={fileRef}
@@ -779,7 +920,19 @@ function ClearAll({ onClick, confirm }: { onClick: () => void; confirm: string }
   );
 }
 
-function StorageSettings({ onClearStorage }: { onClearStorage: () => void }) {
+/** Fraction of the cap at which the Bin is worth pointing at. */
+const STORAGE_PRESSURE = 0.8;
+
+function StorageSettings({
+  onClearStorage,
+  binCount,
+  onEmptyBin,
+}: {
+  onClearStorage: () => void;
+  /** How many documents the Bin is holding, for the pressure prompt. */
+  binCount: number;
+  onEmptyBin: () => void;
+}) {
   const [usage, setUsage] = useState<number | null>(null);
   const [quota, setQuota] = useState<number | null>(null);
 
@@ -794,6 +947,10 @@ function StorageSettings({ onClearStorage }: { onClearStorage: () => void }) {
 
   const cap = quota != null ? Math.floor(quota * STORAGE_QUOTA_FRACTION) : null;
   const pct = usage != null && cap ? Math.min(100, (usage / cap) * 100) : null;
+  // Warned before writes start failing, not after: at this point there is still
+  // room to act, and the Bin is the one place holding files nobody asked to
+  // keep.
+  const underPressure = pct !== null && pct >= STORAGE_PRESSURE * 100 && binCount > 0;
 
   return (
     <div className="space-y-10">
@@ -811,12 +968,36 @@ function StorageSettings({ onClearStorage }: { onClearStorage: () => void }) {
             {pct !== null && (
               <div className="mt-2.5 h-1 overflow-hidden rounded-full bg-muted">
                 <div
-                  className="h-full rounded-full bg-primary transition-[width] duration-500"
+                  className={`h-full rounded-full transition-[width] duration-500 ${
+                    underPressure ? "bg-amber-500" : "bg-primary"
+                  }`}
                   style={{ width: `${Math.max(pct, 1)}%` }}
                 />
               </div>
             )}
           </div>
+          {underPressure && (
+            <Row
+              label="Storage is nearly full"
+              hint={`The Bin is holding ${binCount} file${binCount === 1 ? "" : "s"}. Emptying it frees that space now.`}
+              control={
+                <button
+                  onClick={() => {
+                    if (
+                      window.confirm(
+                        `Permanently delete ${binCount} file${binCount === 1 ? "" : "s"} in the Bin?`,
+                      )
+                    ) {
+                      onEmptyBin();
+                    }
+                  }}
+                  className="rounded-md px-2.5 py-1 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10"
+                >
+                  Empty Bin
+                </button>
+              }
+            />
+          )}
         </Group>
       </Section>
 
@@ -966,38 +1147,80 @@ function HighlightSettings({
   );
 }
 
-function ArchiveSettings({
+/**
+ * The Bin: everything the reader has removed, and how long it has left.
+ *
+ * This replaced a separate Archive panel and an irreversible Delete. A binned
+ * document is recoverable for thirty days and says so per row, so "remove" no
+ * longer means two different things depending on which menu item was used.
+ */
+function BinSettings({
   files,
-  onUnarchive,
+  onRestore,
+  onDeleteForever,
+  onEmptyBin,
 }: {
   files: MdFile[];
-  onUnarchive: (id: string) => void;
+  onRestore: (id: string) => void;
+  onDeleteForever: (id: string) => void;
+  onEmptyBin: () => void;
 }) {
-  const archivedFiles = files.filter((f) => f.isArchived);
+  const binned = files
+    .filter((f) => typeof f.deletedAt === "number")
+    .sort((a, b) => (b.deletedAt ?? 0) - (a.deletedAt ?? 0));
+
+  const daysLeft = (deletedAt: number) =>
+    Math.max(0, Math.ceil((deletedAt + BIN_RETENTION_MS - Date.now()) / (24 * 60 * 60 * 1000)));
 
   return (
     <Section
-      title="Archived"
-      description="Archived files are hidden from the sidebar but stay available as embedded resources."
+      title="Bin"
+      description="Removed files stay here for 30 days, then delete themselves. Restore one at any time before that."
+      action={
+        binned.length > 0 && (
+          <ClearAll
+            onClick={onEmptyBin}
+            confirm={`Permanently delete ${binned.length} file${binned.length === 1 ? "" : "s"} in the Bin?`}
+          />
+        )
+      }
     >
       <Group>
-        {archivedFiles.length === 0 ? (
-          <Empty>No archived files.</Empty>
+        {binned.length === 0 ? (
+          <Empty>The Bin is empty.</Empty>
         ) : (
-          archivedFiles.map((file) => (
-            <Row
-              key={file.id}
-              label={file.name}
-              control={
-                <button
-                  onClick={() => onUnarchive(file.id)}
-                  className="rounded-md px-2.5 py-1 text-xs font-medium text-primary transition-colors hover:bg-primary/10"
-                >
-                  Unarchive
-                </button>
-              }
-            />
-          ))
+          binned.map((file) => {
+            const left = daysLeft(file.deletedAt as number);
+            return (
+              <Row
+                key={file.id}
+                label={file.name}
+                hint={
+                  left === 0 ? "Deletes on next open" : `${left} day${left === 1 ? "" : "s"} left`
+                }
+                control={
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => onRestore(file.id)}
+                      className="rounded-md px-2.5 py-1 text-xs font-medium text-primary transition-colors hover:bg-primary/10"
+                    >
+                      Restore
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (window.confirm(`Permanently delete "${file.name}"?`)) {
+                          onDeleteForever(file.id);
+                        }
+                      }}
+                      className="rounded-md px-2.5 py-1 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                }
+              />
+            );
+          })
         )}
       </Group>
     </Section>

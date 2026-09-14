@@ -1,12 +1,24 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createPortal } from "react-dom";
-import { Download, Expand, LoaderCircle, Minus, Plus, Star, X } from "lucide-react";
+import { Download, Expand, LoaderCircle, Minimize2, Minus, Plus, Star } from "lucide-react";
 import { toast } from "sonner";
 import type { MermaidAnimator as MermaidAnimatorInstance } from "mermaid-animator";
 import { useSaveAction } from "./save-action";
-import { clearRenderArtifacts, describeRenderError } from "./render-error";
+import { describeRenderError } from "./render-error";
 import { largeDiagramMermaidConfig } from "./mermaid-config";
+import { renderMermaid } from "./mermaid-render-cache";
+import { DiagramNodeColorPopover } from "./DiagramNodeColorPopover";
 import {
+  COLORABLE_NODES,
+  applyOne,
+  applyOverrides,
+  diagramKey,
+  loadOverrides,
+  nodeKey,
+  saveOverride,
+  type NodeOverrides,
+} from "@/lib/diagram-node-colors";
+import {
+  isRenderedDiagramTooLarge,
   optimizeSvgForImageRendering,
   readSvgViewBox,
   shouldUseDiagramPerformanceMode,
@@ -176,6 +188,10 @@ export function Mermaid({
   mode?: MermaidMode;
 }) {
   const [fullscreen, setFullscreen] = useState(false);
+  // Raw mode draws a plain SVG with no pan/zoom handler behind it — the
+  // animated stages get theirs from the animator. Scaling the host box is the
+  // equivalent that works for a static diagram, inline and fullscreen alike.
+  const [rawZoom, setRawZoom] = useState(1);
   const [mode, setMode] = useState<MermaidMode>(initialMode);
   const [dark, setDark] = useState(
     () => typeof document !== "undefined" && document.documentElement.classList.contains("dark"),
@@ -198,7 +214,17 @@ export function Mermaid({
   // Trimming a multi-megabyte source on every state update is measurable. The
   // prop changes only when the document changes, so retain the normalized view.
   const source = useMemo(() => code.trim(), [code]);
-  const performanceMode = useMemo(() => shouldUseDiagramPerformanceMode(source), [source]);
+  const sourceTooLarge = useMemo(() => shouldUseDiagramPerformanceMode(source), [source]);
+  /**
+   * Set when the rendered SVG turned out to be too large even though the
+   * source scan cleared it. Held separately from the source verdict so the two
+   * stages of the gate stay legible, and combined below.
+   */
+  const [renderTooLarge, setRenderTooLarge] = useState(false);
+  const handleOversized = useCallback(() => setRenderTooLarge(true), []);
+  // A new diagram deserves a fresh verdict; the old one's may not apply.
+  useEffect(() => setRenderTooLarge(false), [source]);
+  const performanceMode = sourceTooLarge || renderTooLarge;
   const [performanceImageUrl, setPerformanceImageUrl] = useState<string | null>(null);
   const handlePerformanceImage = useCallback((url: string | null) => {
     setPerformanceImageUrl(url);
@@ -238,17 +264,32 @@ export function Mermaid({
   // fresh render attempt rather than staying stuck on the previous failure.
   useEffect(() => setRenderError(null), [source, dark, mode]);
 
+  // A zoom belongs to the diagram it was applied to. Leaving it set across an
+  // edit or a mode switch would re-open the next render already magnified, with
+  // no indication why.
+  useEffect(() => setRawZoom(1), [source, mode]);
+
+  // Full screen is the frame's own, through the Fullscreen API, rather than an
+  // overlay painted over the page. An overlay is only ever as large as the
+  // viewport the browser chrome leaves behind, and a diagram is exactly the
+  // thing worth handing the whole display.
+  //
+  // The state follows the document rather than the button: Escape and the
+  // browser's own exit both leave full screen without going through the
+  // control, and the flag has to agree either way.
+  const frameRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (!fullscreen) return;
-    const previous = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    const onKey = (event: KeyboardEvent) => event.key === "Escape" && setFullscreen(false);
-    window.addEventListener("keydown", onKey);
-    return () => {
-      document.body.style.overflow = previous;
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [fullscreen]);
+    const sync = () => setFullscreen(document.fullscreenElement === frameRef.current);
+    document.addEventListener("fullscreenchange", sync);
+    return () => document.removeEventListener("fullscreenchange", sync);
+  }, []);
+
+  const toggleFullscreen = useCallback(() => {
+    const el = frameRef.current;
+    if (!el) return;
+    if (document.fullscreenElement === el) void document.exitFullscreen();
+    else void el.requestFullscreen?.().catch(() => setFullscreen(false));
+  }, []);
 
   // One download, one format. The animation *is* the artifact, and WebM is the
   // only export that carries it; GIF and a still SVG were each a lossy answer to
@@ -318,6 +359,24 @@ export function Mermaid({
   const visibleMode = performanceMode ? "raw" : mode;
   const modeControl = <ModeTabs mode={visibleMode} onChange={setMode} unavailable={unavailable} />;
 
+  // Kept inside the same bounds the animated stages use, so a diagram cannot be
+  // zoomed into a state the other modes could not show.
+  const rawZoomBy = (factor: number) =>
+    setRawZoom((z) => Math.min(ZOOM_LIMIT.max, Math.max(ZOOM_LIMIT.min, z * factor)));
+  const rawZoomControls = (
+    <>
+      <TrayButton onClick={() => rawZoomBy(1 / 1.3)} label="Zoom out">
+        <Minus className="h-3.5 w-3.5" />
+      </TrayButton>
+      <TrayButton onClick={() => setRawZoom(1)} label="Fit diagram">
+        <span className="text-[10px] font-semibold tabular-nums">{Math.round(rawZoom * 100)}%</span>
+      </TrayButton>
+      <TrayButton onClick={() => rawZoomBy(1.3)} label="Zoom in">
+        <Plus className="h-3.5 w-3.5" />
+      </TrayButton>
+    </>
+  );
+
   // An unsupported diagram still has to show something: render it raw while
   // leaving the reader's chosen tab alone.
   const effectiveMode: MermaidMode =
@@ -347,8 +406,15 @@ export function Mermaid({
       <Tray>
         {saveControl}
         {effectiveMode === "flow" ? downloadControl : null}
-        <TrayButton onClick={() => setFullscreen(true)} label="Fullscreen">
-          <Expand className="h-3.5 w-3.5" />
+        {/* Raw is the one mode with no pan/zoom handler of its own, so it gets
+            these. The animated stages carry their own pair down on the
+            artwork. */}
+        {effectiveMode === "raw" ? rawZoomControls : null}
+        <TrayButton
+          onClick={toggleFullscreen}
+          label={fullscreen ? "Exit full screen" : "Fullscreen"}
+        >
+          {fullscreen ? <Minimize2 className="h-3.5 w-3.5" /> : <Expand className="h-3.5 w-3.5" />}
         </TrayButton>
       </Tray>
     </div>
@@ -382,10 +448,12 @@ export function Mermaid({
           colored={colored && !performanceMode}
           fill={stageFill}
           controls={controls}
+          zoom={rawZoom}
           onError={setRenderError}
           onRatio={stageFill ? undefined : setStageRatio}
           performanceMode={performanceMode}
           onPerformanceImage={handlePerformanceImage}
+          onOversized={handleOversized}
         />
       );
     }
@@ -409,63 +477,40 @@ export function Mermaid({
           is the stage's, mirrored here, because `w-fit` would instead collapse a
           wide diagram to its intrinsic width and shrink the picture. */}
       <div
-        className="mermaid-frame my-6 overflow-hidden rounded-xl border border-border bg-muted/30 mx-auto"
-        style={frameCap ? { maxWidth: frameCap } : undefined}
+        ref={frameRef}
+        className={`mermaid-frame overflow-hidden border-border bg-muted/30 ${
+          fullscreen
+            ? "flex h-screen w-screen flex-col rounded-none border-0"
+            : "my-6 rounded-xl border mx-auto"
+        }`}
+        style={fullscreen ? undefined : frameCap ? { maxWidth: frameCap } : undefined}
         data-performance-mode={performanceMode ? "" : undefined}
       >
         {header}
-        {renderError ? <MermaidError error={renderError} /> : stageFor(false)}
-      </div>
-
-      {fullscreen &&
-        createPortal(
-          <div className="fixed inset-0 z-(--z-overlay) flex items-center justify-center p-0 sm:p-4">
-            <div
-              className="absolute inset-0 bg-foreground/30 backdrop-blur-sm"
-              onClick={() => setFullscreen(false)}
-              aria-hidden
-            />
-            <div
-              role="dialog"
-              aria-modal="true"
-              aria-label="Animated Mermaid diagram"
-              className="relative flex h-full w-full flex-col overflow-hidden border-border bg-card shadow-2xl sm:h-[92vh] sm:max-w-[min(1600px,95vw)] sm:rounded-2xl sm:border"
-            >
-              <header className="flex h-14 shrink-0 items-center justify-between gap-3 border-b border-border px-4 sm:px-6">
-                <div>
-                  <h1 className="text-sm font-semibold text-foreground">{baseName(name)}</h1>
-                  <p className="text-[11px] text-muted-foreground">
-                    {performanceMode ? "Large-diagram performance mode" : MODE_HINT[mode]}
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  {modeControl}
-                  <Tray>
-                    {saveControl}
-                    {effectiveMode === "flow" ? downloadControl : null}
-                  </Tray>
-                  <Tray key="close">
-                    <TrayButton onClick={() => setFullscreen(false)} label="Close diagram">
-                      <X className="h-4 w-4" />
-                    </TrayButton>
-                  </Tray>
-                </div>
-              </header>
-              <div className="min-h-0 flex-1">
-                {performanceMode ? (
-                  performanceImageUrl ? (
-                    <PerformanceDiagramImage src={performanceImageUrl} name={baseName(name)} fill />
-                  ) : (
-                    <StageSpinner label="Preparing large diagram…" />
-                  )
-                ) : (
-                  stageFor(true)
-                )}
-              </div>
-            </div>
-          </div>,
-          document.body,
+        {/* One stage, which simply grows into the screen when the frame does.
+            There used to be a second copy inside an overlay, and the inline one
+            was torn down while it was open to avoid paying for two live SVGs at
+            once; with the frame itself going full screen there is only ever one
+            diagram mounted, so nothing has to be swapped out or measured to
+            stop the surrounding text from jumping. */}
+        {renderError ? (
+          <MermaidError error={renderError} />
+        ) : fullscreen ? (
+          <div className="min-h-0 flex-1">
+            {performanceMode ? (
+              performanceImageUrl ? (
+                <PerformanceDiagramImage src={performanceImageUrl} name={baseName(name)} fill />
+              ) : (
+                <StageSpinner label="Preparing large diagram…" />
+              )
+            ) : (
+              stageFor(true)
+            )}
+          </div>
+        ) : (
+          stageFor(false)
         )}
+      </div>
     </>
   );
 }
@@ -578,7 +623,6 @@ function AnimatorStage({
           setRatio(measured);
           onRatio?.(measured);
         }
-        if (fill) requestAnimationFrame(() => animator.fitToView());
         setLoading(false);
       } catch (error) {
         if (!disposed) {
@@ -604,7 +648,20 @@ function AnimatorStage({
         ownerGenerationRef.current = 0;
       }
     };
-  }, [code, dark, fill, onError, onRatio]);
+    // `fill` is deliberately absent: it changes how the diagram is *framed*,
+    // not what it contains, and listing it here made opening fullscreen
+    // destroy the animator and lay the whole diagram out again — twice per
+    // toggle, since closing did it too. Framing is applied by the effect below
+    // instead, against the instance that is already running.
+  }, [code, dark, onError, onRatio]);
+
+  // Re-frame an existing animator when the stage changes shape. Cheap: it
+  // writes a viewBox, where a re-create would re-run Mermaid's layout.
+  useEffect(() => {
+    if (!fill || loading) return;
+    const frame = requestAnimationFrame(() => animatorRef.current?.fitToView());
+    return () => cancelAnimationFrame(frame);
+  }, [fill, loading]);
 
   return (
     <div
@@ -670,6 +727,32 @@ function AnimatorStage({
   );
 }
 
+/**
+ * Mark every node a reader can recolour.
+ *
+ * The attribute is what `diagram-colors.css` hangs the hover affordance on, and
+ * the tooltip is the only discovery this feature gets — nothing about a
+ * rendered box says "clickable" on its own.
+ */
+function markColorableNodes(svg: SVGSVGElement): void {
+  for (const node of svg.querySelectorAll<SVGElement>(COLORABLE_NODES)) {
+    node.setAttribute("data-colorable", "");
+    // The tooltip goes on the *shape*, never on the node group.
+    //
+    // An SVG <title> is real text content: appended to the group, it joined the
+    // node's own label, so `node.textContent` came back as "Ordinary stepClick
+    // to change…". That is not cosmetic — semantics.ts classifies a node by
+    // matching keywords against exactly that string, and the colour picker
+    // shows it back to the reader as the node's name.
+    const shape = node.querySelector("rect, polygon, circle, ellipse, path");
+    if (shape && !shape.querySelector("title")) {
+      const tip = document.createElementNS("http://www.w3.org/2000/svg", "title");
+      tip.textContent = "Click to change this block's colour";
+      shape.appendChild(tip);
+    }
+  }
+}
+
 /** Shared placeholder while a stage's chunk or render is in flight. */
 function StageSpinner({ label }: { label: string }) {
   return (
@@ -694,10 +777,12 @@ function StaticStage({
   colored,
   fill,
   controls,
+  zoom = 1,
   onError,
   onRatio,
   performanceMode,
   onPerformanceImage,
+  onOversized,
 }: {
   code: string;
   dark: boolean;
@@ -705,10 +790,18 @@ function StaticStage({
   colored?: boolean;
   fill?: boolean;
   controls?: React.ReactNode;
+  /** Scale factor from the tray's zoom controls; 1 is the fitted diagram. */
+  zoom?: number;
   onError: (message: string | null) => void;
   onRatio?: (ratio: number) => void;
   performanceMode?: boolean;
   onPerformanceImage?: (url: string | null) => void;
+  /**
+   * Fired when the *rendered* diagram turns out to be too large for live DOM,
+   * even though the source scan let it through. The caller uses this to drop
+   * the animated modes, exactly as it would for a source-flagged diagram.
+   */
+  onOversized?: () => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(true);
@@ -716,6 +809,78 @@ function StaticStage({
   const [size, setSize] = useState<DiagramSize | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const imageUrlRef = useRef<string | null>(null);
+  /**
+   * Whether this render is being shown as a flattened image.
+   *
+   * Distinct from the `performanceMode` prop: that is the source-scan verdict,
+   * known before rendering, while this also covers a diagram that only
+   * revealed its size once Mermaid had laid it out.
+   */
+  const [asImage, setAsImage] = useState(Boolean(performanceMode));
+
+  /**
+   * The reader's own colours for this diagram's nodes.
+   *
+   * Held in a ref as well as state: the render effect re-applies them to each
+   * fresh SVG, and reading them from state there would mean listing them as a
+   * dependency and re-rendering the whole diagram every time one box changed.
+   */
+  const diagram = useMemo(() => diagramKey(code), [code]);
+  const [overrides, setOverrides] = useState<NodeOverrides>(() => loadOverrides(diagram));
+  const overridesRef = useRef(overrides);
+  overridesRef.current = overrides;
+  // A different diagram has different overrides; the previous one's must not
+  // leak onto it.
+  useEffect(() => {
+    const next = loadOverrides(diagram);
+    overridesRef.current = next;
+    setOverrides(next);
+  }, [diagram]);
+
+  /** The node whose colour is being picked, if any. */
+  const [picker, setPicker] = useState<{ node: string; label: string; rect: DOMRect } | null>(null);
+  // A re-render moves every node, so a picker still pointing at the old
+  // rectangle would float away from its box.
+  useEffect(() => setPicker(null), [code, dark, colored]);
+
+  const pickColor = useCallback(
+    (color: string | null) => {
+      if (!picker) return;
+      const svgEl = hostRef.current?.querySelector("svg");
+      if (svgEl) {
+        // Repaint immediately rather than waiting on a re-render that is not
+        // coming: the SVG is imperative, and nothing else would redraw it.
+        applyOne(svgEl as SVGSVGElement, picker.node, color);
+        // Clearing an override puts the node back to whatever the semantic
+        // palette said, which only a fresh pass can decide.
+        if (!color && colored) {
+          void import("@/lib/explainer/semantics").then(({ applySemantics }) =>
+            applySemantics(svgEl as SVGSVGElement),
+          );
+        }
+      }
+      setOverrides(saveOverride(diagram, picker.node, color));
+      setPicker(null);
+    },
+    [colored, diagram, picker],
+  );
+
+  /** Open the picker on whichever node was clicked. */
+  const onHostClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    const target = event.target as Element | null;
+    const node = target?.closest?.(COLORABLE_NODES);
+    if (!node) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setPicker({
+      node: nodeKey(node),
+      // The node's own label, not its whole text content: the click-to-recolour
+      // tooltip is an SVG <title> living on the shape, and `textContent` would
+      // hand the reader "Click to change this block's colourOrdinary step".
+      label: (node.querySelector(".nodeLabel") ?? node).textContent?.trim() ?? "",
+      rect: node.getBoundingClientRect(),
+    });
+  }, []);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -729,19 +894,21 @@ function StaticStage({
     }
     setLoading(true);
     onError(null);
-    // Declared out here so the failure path can clean up after the same id.
-    const id = `static-${Math.random().toString(36).slice(2, 10)}`;
     const run = async () => {
       try {
-        const { default: mermaid } = await import("mermaid");
-        mermaid.initialize({
-          startOnLoad: false,
-          theme: dark ? "dark" : "default",
-          ...largeDiagramMermaidConfig(performanceMode),
-        });
-        const { svg } = await mermaid.render(id, code);
+        const { svg } = await renderMermaid(code, dark, Boolean(performanceMode));
         if (disposed) return;
-        if (performanceMode) {
+        // Stage two of the size gate. The source scan catches the obvious
+        // monsters, but a short, dense diagram — forty ER entities of thirty
+        // attributes — only reveals its true size once laid out. Measuring the
+        // result and downgrading here is what makes the guarantee hold for the
+        // diagrams the pre-scan cannot see.
+        const oversized = performanceMode || isRenderedDiagramTooLarge(svg);
+        if (oversized) {
+          setAsImage(true);
+          // Tell the parent only when the source scan had cleared it; a
+          // source-flagged diagram has already disabled those modes.
+          if (!performanceMode) onOversized?.();
           const view = readSvgViewBox(svg);
           if (view) {
             const measured = clampStageRatio(view.height / view.width);
@@ -774,6 +941,12 @@ function StaticStage({
             if (disposed) return;
             applySemantics(svgEl as SVGSVGElement);
           }
+          // The reader's own colours go on last, so they beat both the
+          // semantic palette and any fill the diagram's author set. The render
+          // cache hands back the same SVG string each time, so these have to be
+          // re-applied to every fresh copy rather than living in the markup.
+          applyOverrides(svgEl as SVGSVGElement, overridesRef.current);
+          markColorableNodes(svgEl as SVGSVGElement);
           svgEl.style.maxWidth = "100%";
           svgEl.style.width = "100%";
           svgEl.style.height = "100%";
@@ -790,7 +963,6 @@ function StaticStage({
         }
         setLoading(false);
       } catch (error) {
-        clearRenderArtifacts(id);
         if (disposed) return;
         setLoading(false);
         onError(describeRenderError(error));
@@ -804,9 +976,9 @@ function StaticStage({
       onPerformanceImage?.(null);
       if (host) host.innerHTML = "";
     };
-  }, [code, dark, colored, onError, onPerformanceImage, onRatio, performanceMode]);
+  }, [code, dark, colored, onError, onOversized, onPerformanceImage, onRatio, performanceMode]);
 
-  if (performanceMode) {
+  if (asImage) {
     return (
       <div className="relative min-h-64 w-full">
         {loading || !imageUrl ? (
@@ -839,14 +1011,35 @@ function StaticStage({
           <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> Rendering diagram…
         </div>
       )}
-      <div
-        ref={hostRef}
-        data-tall={!fill && ratio && isTallStage(ratio) ? "" : undefined}
-        className={`${fill ? "h-full min-h-0 w-full" : "w-full box-content"}${
-          colored ? " diagram-colored" : ""
-        }`}
-        style={fill ? undefined : stageBoxStyle(ratio ?? 0.42, TRAY_GUTTER, size ?? undefined)}
-      />
+      {/* Zoom scales the diagram inside a clipping box rather than growing the
+          stage, so a magnified diagram is panned to by scrolling this box and
+          the surrounding document never reflows. Transform, not width/height:
+          it stays on the compositor and does not restyle the SVG's nodes. */}
+      <div className={zoom > 1 ? "h-full w-full overflow-auto" : "contents"}>
+        <div
+          ref={hostRef}
+          onClick={onHostClick}
+          data-tall={!fill && ratio && isTallStage(ratio) ? "" : undefined}
+          className={`${fill ? "h-full min-h-0 w-full" : "w-full box-content"}${
+            colored ? " diagram-colored" : ""
+          }`}
+          style={{
+            ...(fill ? undefined : stageBoxStyle(ratio ?? 0.42, TRAY_GUTTER, size ?? undefined)),
+            ...(zoom === 1
+              ? undefined
+              : { transform: `scale(${zoom})`, transformOrigin: "top left" }),
+          }}
+        />
+      </div>
+      {picker && (
+        <DiagramNodeColorPopover
+          anchor={picker.rect}
+          label={picker.label}
+          current={overrides[picker.node] ?? null}
+          onPick={pickColor}
+          onClose={() => setPicker(null)}
+        />
+      )}
     </div>
   );
 }

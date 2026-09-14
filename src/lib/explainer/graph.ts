@@ -13,6 +13,15 @@
 
 import { isSequenceDiagram, readSequence } from "./sequence";
 
+/**
+ * Node count past which exact per-node measurement stops being affordable.
+ *
+ * Each `getBBox` is a layout flush; the explainer only uses the result for
+ * camera framing, so an approximation is a fair trade well before the point
+ * where the flushes themselves freeze the tab.
+ */
+const EXACT_MEASURE_BUDGET = 1_200;
+
 /** A node as laid out by Mermaid. */
 export interface ExplainerNode {
   /** The mermaid-assigned element id; unique within one render. */
@@ -123,38 +132,131 @@ const EDGE_SELECTOR = [
  */
 function endpointsByGeometry(
   path: SVGPathElement,
-  nodes: ExplainerNode[],
+  index: NodeIndex,
+  length: number,
 ): { source: ExplainerNode; target: ExplainerNode } | null {
-  if (nodes.length === 0) return null;
+  if (index.isEmpty) return null;
   let start: DOMPoint;
   let end: DOMPoint;
   try {
-    const length = path.getTotalLength();
     if (!length) return null;
     start = path.getPointAtLength(0);
     end = path.getPointAtLength(length);
   } catch {
     return null;
   }
-  const nearest = (point: { x: number; y: number }) => {
-    let best: ExplainerNode | null = null;
-    let bestDistance = Infinity;
-    for (const node of nodes) {
-      const dx = Math.max(Math.abs(point.x - node.x) - node.width / 2, 0);
-      const dy = Math.max(Math.abs(point.y - node.y) - node.height / 2, 0);
-      const distance = Math.hypot(dx, dy);
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        best = node;
-      }
-    }
-    return best;
-  };
-  const source = nearest(start);
-  const target = nearest(end);
+  const source = index.nearest(start);
+  const target = index.nearest(end);
   if (!source || !target || source === target) return null;
   return { source, target };
 }
+
+/**
+ * A uniform grid over the diagram, for resolving an edge endpoint to a node.
+ *
+ * The linear version of this scanned every node twice per edge, which is
+ * O(edges × nodes) — on a state or ER diagram (where Mermaid does not name
+ * endpoints in `data-id`, so *every* edge takes this path) that was the single
+ * most expensive thing in the render. Bucketing by cell turns the common case
+ * into a look at the endpoint's own cell and its immediate neighbours.
+ *
+ * The search widens ring by ring and only stops once the nearest candidate is
+ * closer than the next ring could possibly be, so the answer is identical to
+ * the exhaustive scan — this is a faster way to the same node, not an
+ * approximation.
+ */
+class NodeIndex {
+  private readonly cells = new Map<string, ExplainerNode[]>();
+  private readonly cellSize: number;
+  private readonly nodes: ExplainerNode[];
+
+  constructor(nodes: ExplainerNode[]) {
+    this.nodes = nodes;
+    // Size cells to the typical node, so a cell holds a handful of entries
+    // rather than one each (memory) or all of them (no speedup).
+    const median =
+      nodes.length === 0
+        ? 1
+        : Math.max(
+            1,
+            nodes.reduce((sum, node) => sum + Math.max(node.width, node.height), 0) / nodes.length,
+          );
+    this.cellSize = median * 2;
+    for (const node of nodes) {
+      const key = this.key(node.x, node.y);
+      const bucket = this.cells.get(key);
+      if (bucket) bucket.push(node);
+      else this.cells.set(key, [node]);
+    }
+  }
+
+  get isEmpty(): boolean {
+    return this.nodes.length === 0;
+  }
+
+  private key(x: number, y: number): string {
+    return `${Math.floor(x / this.cellSize)},${Math.floor(y / this.cellSize)}`;
+  }
+
+  private static distance(point: { x: number; y: number }, node: ExplainerNode): number {
+    const dx = Math.max(Math.abs(point.x - node.x) - node.width / 2, 0);
+    const dy = Math.max(Math.abs(point.y - node.y) - node.height / 2, 0);
+    return Math.hypot(dx, dy);
+  }
+
+  nearest(point: { x: number; y: number }): ExplainerNode | null {
+    if (this.isEmpty) return null;
+    const originX = Math.floor(point.x / this.cellSize);
+    const originY = Math.floor(point.y / this.cellSize);
+
+    let best: ExplainerNode | null = null;
+    let bestDistance = Infinity;
+
+    // Widen the ring until the closest possible node in the next ring is
+    // further than what we already have. A node's own extent can straddle
+    // cells, so the guard uses the ring's inner edge, not its centre.
+    for (let ring = 0; ring < MAX_INDEX_RINGS; ring++) {
+      if (best && (ring - 1) * this.cellSize > bestDistance) break;
+      let examined = false;
+      for (let dx = -ring; dx <= ring; dx++) {
+        for (let dy = -ring; dy <= ring; dy++) {
+          // Only the ring's perimeter is new; the interior was covered already.
+          if (ring > 0 && Math.abs(dx) !== ring && Math.abs(dy) !== ring) continue;
+          const bucket = this.cells.get(`${originX + dx},${originY + dy}`);
+          if (!bucket) continue;
+          examined = true;
+          for (const node of bucket) {
+            const distance = NodeIndex.distance(point, node);
+            if (distance < bestDistance) {
+              bestDistance = distance;
+              best = node;
+            }
+          }
+        }
+      }
+      // An empty neighbourhood far from everything: fall back rather than
+      // spiralling out over a sparse grid forever.
+      if (!examined && ring > SPARSE_RING_GIVEUP && !best) break;
+    }
+
+    // A diagram laid out so sparsely that the rings found nothing still has to
+    // answer. This runs at most once per endpoint, not once per node.
+    if (!best) {
+      for (const node of this.nodes) {
+        const distance = NodeIndex.distance(point, node);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          best = node;
+        }
+      }
+    }
+    return best;
+  }
+}
+
+/** Rings to widen before giving up on the grid and scanning directly. */
+const MAX_INDEX_RINGS = 32;
+const SPARSE_RING_GIVEUP = 4;
 
 function splitEdgeId(dataId: string, keys: Set<string>): { source: string; target: string } | null {
   const body = dataId.replace(/^L_/, "").replace(/_\d+$/, "");
@@ -186,17 +288,36 @@ export function readGraph(svg: SVGSVGElement): ExplainerGraph | null {
 
   const nodes = new Map<string, ExplainerNode>();
   const byKey = new Map<string, ExplainerNode>();
-  for (const el of svg.querySelectorAll<SVGGElement>("g.node")) {
+  const nodeElements = svg.querySelectorAll<SVGGElement>("g.node");
+  // `getBBox` forces a synchronous layout. One call is trivial; one per node
+  // over a few thousand nodes is seconds of blocking work before the explainer
+  // has drawn anything. Past the budget the boxes are approximated from the
+  // element's own geometry attributes instead, which costs no layout — the
+  // camera loses a little padding accuracy and nothing else.
+  const measureExactly = nodeElements.length <= EXACT_MEASURE_BUDGET;
+  for (const el of nodeElements) {
     const position = absoluteTranslate(el);
     let width = 0;
     let height = 0;
-    try {
-      const box = el.getBBox();
-      width = box.width;
-      height = box.height;
-    } catch {
-      // getBBox throws on a detached or display:none subtree. A zero box only
-      // costs the camera some padding, so it is not worth failing the render.
+    if (measureExactly) {
+      try {
+        const box = el.getBBox();
+        width = box.width;
+        height = box.height;
+      } catch {
+        // getBBox throws on a detached or display:none subtree. A zero box only
+        // costs the camera some padding, so it is not worth failing the render.
+      }
+    } else {
+      const shape = el.querySelector("rect, circle, ellipse, polygon, path");
+      const attr = (name: string) => parseFloat(shape?.getAttribute(name) ?? "") || 0;
+      // A circle and an ellipse carry radii rather than a width and a height,
+      // so reading `width` off them would silently yield a zero box and lose
+      // the camera its padding on exactly the diagrams that use them.
+      const radiusX = attr("rx") || attr("r");
+      const radiusY = attr("ry") || attr("r");
+      width = attr("width") || radiusX * 2;
+      height = attr("height") || radiusY * 2;
     }
     const node: ExplainerNode = {
       id: el.id,
@@ -223,6 +344,9 @@ export function readGraph(svg: SVGSVGElement): ExplainerGraph | null {
 
   const edges: ExplainerEdge[] = [];
   const nodeList = [...nodes.values()];
+  // Built once, not once per edge. Only needed when an edge fails to name its
+  // endpoints, so it is created lazily — a flowchart never pays for it.
+  let geometryIndex: NodeIndex | null = null;
   paths.forEach((path, index) => {
     const dataId = path.getAttribute("data-id") ?? path.id;
     // Flowchart, class and ER diagrams name their endpoints in the edge id.
@@ -232,19 +356,24 @@ export function readGraph(svg: SVGSVGElement): ExplainerGraph | null {
     const named = splitEdgeId(dataId, keys);
     let source = named ? byKey.get(named.source) : undefined;
     let target = named ? byKey.get(named.target) : undefined;
-    if (!source || !target) {
-      const ends = endpointsByGeometry(path, nodeList);
-      source = source ?? ends?.source;
-      target = target ?? ends?.target;
-    }
-    if (!source || !target || source === target) return;
+    // `getTotalLength` forces a layout flush, so it is read once and shared
+    // between endpoint resolution and the stored duration rather than being
+    // called twice per edge as it was before.
     let length = 0;
     try {
       length = path.getTotalLength();
     } catch {
-      // Same reasoning as getBBox above; a zero-length edge just draws at the
-      // floor duration instead of being scaled by its length.
+      // getBBox/getTotalLength throw on a detached or display:none subtree. A
+      // zero-length edge just draws at the floor duration instead of being
+      // scaled by its length.
     }
+    if (!source || !target) {
+      geometryIndex ??= new NodeIndex(nodeList);
+      const ends = endpointsByGeometry(path, geometryIndex, length);
+      source = source ?? ends?.source;
+      target = target ?? ends?.target;
+    }
+    if (!source || !target || source === target) return;
     edges.push({
       id: path.id || dataId,
       sourceKey: source.key,
