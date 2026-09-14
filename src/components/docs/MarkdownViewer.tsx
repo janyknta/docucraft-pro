@@ -232,9 +232,13 @@ function MarkdownViewerImpl({
   // editor opened with is kept here, so Cancel can put it back.
   const originalContentRef = useRef(file.content);
 
+  // The editor hands back the id of the document the text was typed into. It is
+  // not necessarily `file.id`: a save can arrive while the reader is switching
+  // files, and routing it by the now-current file would overwrite the document
+  // they just opened with the draft from the one they left.
   const saveDraft = useCallback(
-    (content: string) => onContentChange(file.id, content),
-    [onContentChange, file.id],
+    (fileId: string, content: string) => onContentChange(fileId, content),
+    [onContentChange],
   );
   const leaveEditMode = useCallback(
     (cursorIndex?: number) => {
@@ -1349,6 +1353,10 @@ function MarkdownViewerImpl({
 
             {editMode ? (
               <MarkdownEditor
+                // Keyed by document: switching files tears the editor down and
+                // builds a new one, rather than handing the previous document's
+                // draft to the next document's instance.
+                key={file.id}
                 ref={editorRef}
                 fileId={file.id}
                 initialContent={file.content}

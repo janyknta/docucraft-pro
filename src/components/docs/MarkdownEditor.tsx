@@ -37,8 +37,16 @@ interface Props {
   initialContent: string;
   /** Identity of the document being edited; remounts the draft when it changes. */
   fileId: string;
-  /** Debounced autosave, and the target of the Cmd/Ctrl+S shortcut. */
-  onSave: (content: string) => void;
+  /**
+   * Debounced autosave, and the target of the Cmd/Ctrl+S shortcut.
+   *
+   * Takes the id of the document the text came from, not just the text. The
+   * editor can be asked to save after the parent has already switched files —
+   * the unmount flush below runs during that switch — and a save that only
+   * carried content would land on whichever document happened to be active by
+   * the time it arrived, overwriting it with the previous file's draft.
+   */
+  onSave: (fileId: string, content: string) => void;
   /** Leave the editor, keeping the current draft. Passes back the cursor's source index. */
   onDone: (cursorIndex?: number) => void;
   /** Leave the editor, restoring `initialContent`. Passes back the cursor's source index. */
@@ -54,8 +62,27 @@ function MarkdownEditorImpl(
   { initialContent, fileId, onSave, onDone, onCancel, inspectMissed }: Props,
   handleRef: React.Ref<MarkdownEditorHandle>,
 ) {
-  const [draft, setDraft] = useState(initialContent);
+  // The draft and the document it belongs to are one piece of state, set
+  // together and read together.
+  //
+  // They used to be separate — `draft` here, `fileId` arriving as a prop — and
+  // that is what lost documents. This component is not remounted on a file
+  // switch when the parent reuses the instance, so for one commit `draft` still
+  // held the previous document's text while `fileId` had already become the new
+  // one. Any save firing in that window paired one file's text with another
+  // file's id and overwrote it. Keeping them in a single object makes that pair
+  // impossible to form: every save checks that the draft's own id still matches
+  // the document being edited, and drops the write if it doesn't.
+  const [draft, setDraft] = useState(() => ({ fileId, text: initialContent }));
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const setText = useCallback(
+    (text: string | ((previous: string) => string)) =>
+      setDraft((previous) => ({
+        ...previous,
+        text: typeof text === "function" ? text(previous.text) : text,
+      })),
+    [],
+  );
 
   // Read by the shortcut and the unmount flush, so neither has to be rebuilt
   // (and re-bound) on every keystroke.
@@ -63,12 +90,16 @@ function MarkdownEditorImpl(
   draftRef.current = draft;
   const onSaveRef = useRef(onSave);
   onSaveRef.current = onSave;
+  // The window-level Cmd/Ctrl+S handler is bound once, so it reads the live id
+  // through a ref rather than closing over the prop from its first render.
+  const fileIdRef = useRef(fileId);
+  fileIdRef.current = fileId;
 
   // Switching documents re-seeds the draft. `fileId` rather than
   // `initialContent`, so the parent echoing an autosave back doesn't clobber
   // whatever has been typed since.
   useEffect(() => {
-    setDraft(initialContent);
+    setDraft({ fileId, text: initialContent });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fileId]);
 
@@ -94,17 +125,34 @@ function MarkdownEditorImpl(
   // Autosave. Each of these re-renders the parent's file list, so the pause is
   // deliberately longer than a fast typist's gap between keystrokes.
   useEffect(() => {
-    if (draft === initialContent) return;
-    const t = setTimeout(() => onSaveRef.current(draft), AUTOSAVE_MS);
+    // A draft belonging to the document we just left is not this document's
+    // text. The re-seed effect above is about to replace it; saving in the
+    // meantime is what wrote one file's content over another's.
+    if (draft.fileId !== fileId) return;
+    if (draft.text === initialContent) return;
+    const target = draft.fileId;
+    const text = draft.text;
+    const t = setTimeout(() => onSaveRef.current(target, text), AUTOSAVE_MS);
     return () => clearTimeout(t);
-  }, [draft, initialContent]);
+  }, [draft, initialContent, fileId]);
 
   // Don't lose the tail of a burst of typing when the editor closes between the
   // last keystroke and the autosave firing.
+  //
+  // This is the flush that used to lose documents. It runs *during* a file
+  // switch, after the parent has re-rendered with the new document, so the id
+  // is captured on the way in and the content is written back to the file it
+  // was actually typed into.
   useEffect(() => {
+    const target = fileId;
+    const openedWith = initialContent;
     return () => {
       if (cancelledRef.current) return;
-      if (draftRef.current !== initialContent) onSaveRef.current(draftRef.current);
+      const pending = draftRef.current;
+      // Same guard as the autosave: flush only a draft that still belongs to
+      // the document this effect was set up for.
+      if (pending.fileId !== target) return;
+      if (pending.text !== openedWith) onSaveRef.current(target, pending.text);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fileId]);
@@ -113,7 +161,9 @@ function MarkdownEditorImpl(
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
         e.preventDefault();
-        onSaveRef.current(draftRef.current);
+        const pending = draftRef.current;
+        if (pending.fileId !== fileIdRef.current) return;
+        onSaveRef.current(pending.fileId, pending.text);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -128,25 +178,28 @@ function MarkdownEditorImpl(
    * has to wait for React to commit the new value — setting it against the old
    * text would place it by the wrong offsets.
    */
-  const applyFormat = useCallback((action: FormatAction) => {
-    const ta = textareaRef.current;
-    if (!ta) return;
-    const next = action({ text: ta.value, start: ta.selectionStart, end: ta.selectionEnd });
-    if (
-      next.text === ta.value &&
-      next.start === ta.selectionStart &&
-      next.end === ta.selectionEnd
-    ) {
-      return;
-    }
-    setDraft(next.text);
-    requestAnimationFrame(() => {
-      const el = textareaRef.current;
-      if (!el) return;
-      el.focus({ preventScroll: true });
-      el.setSelectionRange(next.start, next.end);
-    });
-  }, []);
+  const applyFormat = useCallback(
+    (action: FormatAction) => {
+      const ta = textareaRef.current;
+      if (!ta) return;
+      const next = action({ text: ta.value, start: ta.selectionStart, end: ta.selectionEnd });
+      if (
+        next.text === ta.value &&
+        next.start === ta.selectionStart &&
+        next.end === ta.selectionEnd
+      ) {
+        return;
+      }
+      setText(next.text);
+      requestAnimationFrame(() => {
+        const el = textareaRef.current;
+        if (!el) return;
+        el.focus({ preventScroll: true });
+        el.setSelectionRange(next.start, next.end);
+      });
+    },
+    [setText],
+  );
 
   // Formatting shortcuts. Bound on the textarea rather than the window: these
   // are edits to *this* field, and a global binding would fire while the reader
@@ -178,9 +231,9 @@ function MarkdownEditorImpl(
     // Order matters: the flag has to be set before the parent unmounts this
     // component, or the cleanup above would re-save the discarded draft.
     cancelledRef.current = true;
-    setDraft(initialContent);
+    setText(initialContent);
     onCancel(textareaRef.current?.selectionStart);
-  }, [initialContent, onCancel]);
+  }, [initialContent, onCancel, setText]);
 
   return (
     <div>
@@ -229,8 +282,8 @@ function MarkdownEditorImpl(
         <textarea
           id="markdown-source"
           ref={textareaRef}
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
+          value={draft.text}
+          onChange={(e) => setText(e.target.value)}
           onKeyDown={onShortcut}
           spellCheck={false}
           className="min-h-[70vh] w-full resize-y bg-transparent p-4 font-mono text-sm leading-relaxed outline-none"
