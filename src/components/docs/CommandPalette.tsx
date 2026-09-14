@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Command } from "cmdk";
-import GithubSlugger from "github-slugger";
+import { useDocumentSearch } from "@/hooks/use-document-search";
+import type { SearchHit as Hit } from "@/lib/document-search";
 import { FileText, Hash, Search, Clock, X } from "lucide-react";
 import type { MdFile } from "@/lib/markdown-utils";
 
@@ -9,15 +10,6 @@ interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSelect: (fileId: string, headingId?: string, query?: string) => void;
-}
-
-interface Hit {
-  fileId: string;
-  fileName: string;
-  headingId?: string;
-  headingText?: string;
-  snippet: string;
-  score: number;
 }
 
 const RECENT_KEY = "docs-recent-searches";
@@ -30,86 +22,22 @@ export function CommandPalette({ files, open, onOpenChange, onSelect }: Props) {
     try {
       const r = JSON.parse(localStorage.getItem(RECENT_KEY) || "[]");
       if (Array.isArray(r)) setRecent(r);
-    } catch {}
+    } catch {
+      /* Recent searches are optional when browser storage is unavailable. */
+    }
   }, [open]);
 
   useEffect(() => {
     if (!open) setQuery("");
   }, [open]);
 
-  const results = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return [];
-    const hits: Hit[] = [];
-    for (const file of files) {
-      const lines = file.content.split("\n");
-      const fileNameMatch = file.name.toLowerCase().includes(q);
-      let inCode = false;
-      let currentHeading: { id: string; text: string } | null = null;
-      // Match rehypeSlug/parseHeadings exactly so result ids line up with the
-      // rendered DOM ids; otherwise navigation lands on a non-existent hash.
-      const slugger = new GithubSlugger();
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith("```")) {
-          inCode = !inCode;
-          continue;
-        }
-        if (inCode) continue;
-
-        const hm = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line);
-        if (hm) {
-          const text = hm[2].trim();
-          const id = slugger.slug(text || "section");
-          currentHeading = { id, text };
-          if (text.toLowerCase().includes(q)) {
-            hits.push({
-              fileId: file.id,
-              fileName: file.name,
-              headingId: id,
-              headingText: text,
-              snippet: text,
-              score: 100 + (text.toLowerCase().startsWith(q) ? 20 : 0),
-            });
-          }
-          continue;
-        }
-
-        const li = line.toLowerCase();
-        if (li.includes(q)) {
-          const idx = li.indexOf(q);
-          const start = Math.max(0, idx - 40);
-          const end = Math.min(line.length, idx + q.length + 60);
-          hits.push({
-            fileId: file.id,
-            fileName: file.name,
-            headingId: currentHeading?.id,
-            headingText: currentHeading?.text,
-            snippet:
-              (start > 0 ? "…" : "") + line.slice(start, end) + (end < line.length ? "…" : ""),
-            score: 50,
-          });
-        }
-      }
-
-      if (fileNameMatch && !hits.some((h) => h.fileId === file.id && !h.headingId)) {
-        hits.unshift({
-          fileId: file.id,
-          fileName: file.name,
-          snippet: file.name,
-          score: 80,
-        });
-      }
-    }
-    return hits.sort((a, b) => b.score - a.score).slice(0, 60);
-  }, [files, query]);
+  const { hits: results, pending } = useDocumentSearch(files, query, open);
 
   const grouped = useMemo(() => {
     const g = new Map<string, Hit[]>();
     for (const h of results) {
-      if (!g.has(h.fileName)) g.set(h.fileName, []);
-      g.get(h.fileName)!.push(h);
+      if (!g.has(h.fileId)) g.set(h.fileId, []);
+      g.get(h.fileId)!.push(h);
     }
     return Array.from(g.entries());
   }, [results]);
@@ -121,7 +49,9 @@ export function CommandPalette({ files, open, onOpenChange, onSelect }: Props) {
       setRecent(next);
       try {
         localStorage.setItem(RECENT_KEY, JSON.stringify(next));
-      } catch {}
+      } catch {
+        /* Keep search usable when browser storage is unavailable. */
+      }
     }
     onSelect(hit.fileId, hit.headingId, q);
     onOpenChange(false);
@@ -183,7 +113,7 @@ export function CommandPalette({ files, open, onOpenChange, onSelect }: Props) {
             ESC
           </kbd>
         </div>
-        <Command.List className="max-h-[60vh] overflow-y-auto p-2">
+        <Command.List aria-busy={pending} className="max-h-[60vh] overflow-y-auto p-2">
           {!query && recent.length > 0 && (
             <Command.Group heading="Recent searches" className="text-xs text-muted-foreground">
               {recent.map((r) => (
@@ -202,7 +132,9 @@ export function CommandPalette({ files, open, onOpenChange, onSelect }: Props) {
                       setRecent(next);
                       try {
                         localStorage.setItem(RECENT_KEY, JSON.stringify(next));
-                      } catch {}
+                      } catch {
+                        /* The in-memory list still updates. */
+                      }
                     }}
                   >
                     <X className="h-3 w-3 text-muted-foreground hover:text-foreground" />
@@ -211,21 +143,26 @@ export function CommandPalette({ files, open, onOpenChange, onSelect }: Props) {
               ))}
             </Command.Group>
           )}
-          {query && results.length === 0 && (
+          {pending && (
+            <div role="status" className="py-6 text-center text-sm text-muted-foreground">
+              Searching…
+            </div>
+          )}
+          {query && !pending && results.length === 0 && (
             <Command.Empty className="py-12 text-center text-sm text-muted-foreground">
               No results for "{query}"
             </Command.Empty>
           )}
-          {grouped.map(([fileName, hits]) => (
+          {grouped.map(([fileId, hits]) => (
             <Command.Group
-              key={fileName}
-              heading={fileName}
+              key={fileId}
+              heading={hits[0].fileName}
               className="**:[[cmdk-group-heading]]:px-2 **:[[cmdk-group-heading]]:pb-1 **:[[cmdk-group-heading]]:pt-3 **:[[cmdk-group-heading]]:text-xs **:[[cmdk-group-heading]]:font-semibold **:[[cmdk-group-heading]]:uppercase **:[[cmdk-group-heading]]:tracking-wider **:[[cmdk-group-heading]]:text-muted-foreground"
             >
               {hits.map((h, i) => (
                 <Command.Item
-                  key={`${fileName}-${i}`}
-                  value={`${fileName}-${i}-${h.snippet}`}
+                  key={`${fileId}-${i}`}
+                  value={`${fileId}-${i}-${h.snippet}`}
                   onSelect={() => commit(h)}
                   className="group flex cursor-pointer items-start gap-2 rounded-md px-2 py-2 text-sm data-[selected=true]:bg-accent"
                 >

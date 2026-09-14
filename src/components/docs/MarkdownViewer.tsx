@@ -10,6 +10,10 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
+
+// Keep parsing outside updates to menus, selection labels and reader chrome.
+// Context consumers (saved blocks and heading controls) still update normally.
+const MarkdownContent = memo(ReactMarkdown);
 import { useMarkdownPlugins } from "@/lib/markdown-plugins";
 import {
   Check,
@@ -1202,6 +1206,9 @@ function MarkdownViewerImpl({
       workspaceName,
       onOpenArtifact,
       collapsedSections,
+      file.id,
+      chunkForHeading,
+      onNav,
     ],
   );
 
@@ -1557,13 +1564,13 @@ function MarkdownViewerImpl({
               >
                 <SavedContext.Provider value={savedCtx}>
                   <CollapseContext.Provider value={collapseCtx}>
-                    <ReactMarkdown
+                    <MarkdownContent
                       remarkPlugins={remarkPlugins}
                       rehypePlugins={rehypePlugins}
                       components={components}
                     >
                       {markdownSource}
-                    </ReactMarkdown>
+                    </MarkdownContent>
                   </CollapseContext.Provider>
                 </SavedContext.Provider>
               </div>

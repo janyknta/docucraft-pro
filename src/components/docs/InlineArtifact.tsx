@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useState, type ComponentPropsWithoutRef } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState, type ComponentPropsWithoutRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { MdFile } from "@/lib/markdown-utils";
 import { dataUrlToBlob, getDocumentKind } from "@/lib/document-utils";
-import { DocumentViewer } from "./DocumentViewer";
+const DocumentViewer = lazy(() =>
+  import("./DocumentViewer").then((module) => ({ default: module.DocumentViewer })),
+);
 import { MermaidBlock } from "./MermaidLazy";
 import {
   prepareWorkspaceEmbeds,
@@ -45,7 +47,11 @@ export function InlineArtifact({
       workspaceRevision,
       currentWorkspaceFiles,
       currentWorkspaceName,
-    ).then((result) => alive && setArtifact(result));
+    )
+      .then((result) => alive && setArtifact(result))
+      .catch(() => {
+        if (alive) setArtifact(null);
+      });
     return () => {
       alive = false;
     };
@@ -80,7 +86,7 @@ export function InlineArtifact({
             ? "presentation-embed-viewport overflow-hidden rounded-xl border border-border"
             : isMermaid
               ? "overflow-visible"
-            : "artifact-viewport overflow-hidden rounded-xl border border-border"
+              : "artifact-viewport overflow-hidden rounded-xl border border-border"
         }
       >
         {renderArtifact(file, objectUrl, {
@@ -115,7 +121,11 @@ function renderArtifact(file: MdFile, objectUrl: string | null, context: Omit<Pr
       );
     return <EmbeddedMarkdown file={file} {...context} />;
   }
-  return <DocumentViewer file={file} embedded />;
+  return (
+    <Suspense fallback={<div className="artifact-loading">Loading {file.name}…</div>}>
+      <DocumentViewer file={file} embedded />
+    </Suspense>
+  );
 }
 
 function EmbeddedMarkdown({

@@ -118,27 +118,118 @@ export interface WorkspaceRecord {
 export type SaveStatus = "idle" | "saving" | "saved" | "restored";
 
 const DB_NAME = "localdox";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE = "workspaces";
+const FILES = "files";
+const SUMMARIES = "workspace-summaries";
+
+export interface WorkspaceSummary {
+  id: string;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+  docCount: number;
+}
+
+type StoredWorkspace = Omit<WorkspaceRecord, "files"> & { fileIds: string[]; revision: string };
+type StoredFile = PersistedFile & { workspaceId: string };
+
+function summaryOf(w: WorkspaceRecord): WorkspaceSummary {
+  return {
+    id: w.id,
+    name: w.name,
+    createdAt: w.createdAt,
+    updatedAt: w.updatedAt,
+    docCount: w.files.length,
+  };
+}
+
+// Retain only the last workspace's file references, never a second copy of its
+// document bytes. The on-disk revision guards this optimization across tabs.
+let lastWrite: { id: string; revision: string; files: Map<string, PersistedFile> } | null = null;
+
+function sameFile(a: PersistedFile | undefined, b: PersistedFile): boolean {
+  return (
+    !!a &&
+    a.id === b.id &&
+    a.name === b.name &&
+    a.content === b.content &&
+    a.data === b.data &&
+    a.mimeType === b.mimeType &&
+    a.size === b.size &&
+    a.addedAt === b.addedAt &&
+    a.kind === b.kind &&
+    a.folderId === b.folderId &&
+    a.deletedAt === b.deletedAt
+  );
+}
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
 function openDb(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise;
-  dbPromise = new Promise((resolve, reject) => {
+  dbPromise = new Promise<IDBDatabase>((resolve, reject) => {
+    let blocked = false;
     if (typeof indexedDB === "undefined") {
       reject(new Error("IndexedDB unavailable"));
       return;
     }
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = () => {
+      if (blocked) {
+        req.transaction!.abort();
+        return;
+      }
       const db = req.result;
       if (!db.objectStoreNames.contains(STORE)) {
         db.createObjectStore(STORE, { keyPath: "id" });
       }
+      const files = db.createObjectStore(FILES, { keyPath: ["workspaceId", "id"] });
+      files.createIndex("workspaceId", "workspaceId");
+      const summaries = db.createObjectStore(SUMMARIES, { keyPath: "id" });
+      // One atomic migration: an aborted upgrade leaves the v1 data intact.
+      // Use a cursor so only one legacy workspace is materialized at a time.
+      const cursor = req.transaction!.objectStore(STORE).openCursor();
+      cursor.onsuccess = () => {
+        const row = cursor.result;
+        if (!row) return;
+        const workspace = row.value as WorkspaceRecord;
+        for (const file of workspace.files) files.put({ ...file, workspaceId: workspace.id });
+        const { files: documents, ...metadata } = workspace;
+        row.update({
+          ...metadata,
+          fileIds: documents.map((f) => f.id),
+          revision: crypto.randomUUID(),
+        });
+        summaries.put(summaryOf(workspace));
+        row.continue();
+      };
     };
-    req.onsuccess = () => resolve(req.result);
+    req.onsuccess = () => {
+      const db = req.result;
+      if (blocked) {
+        db.close();
+        return;
+      }
+      db.onversionchange = () => {
+        db.close();
+        dbPromise = null;
+        lastWrite = null;
+      };
+      db.onclose = () => {
+        dbPromise = null;
+        lastWrite = null;
+      };
+      resolve(db);
+    };
     req.onerror = () => reject(req.error);
+    req.onblocked = () => {
+      blocked = true;
+      reject(new Error("Close other Localdox tabs to finish updating local storage"));
+    };
+  }).catch((error) => {
+    dbPromise = null;
+    throw error;
   });
   return dbPromise;
 }
@@ -146,13 +237,15 @@ function openDb(): Promise<IDBDatabase> {
 function request<T>(
   mode: IDBTransactionMode,
   fn: (store: IDBObjectStore) => IDBRequest<T>,
+  store = STORE,
 ): Promise<T> {
   return openDb().then(
     (db) =>
       new Promise<T>((resolve, reject) => {
-        const t = db.transaction(STORE, mode);
-        const req = fn(t.objectStore(STORE));
-        req.onsuccess = () => resolve(req.result);
+        const t = db.transaction(store, mode);
+        const req = fn(t.objectStore(store));
+        t.oncomplete = () => resolve(req.result);
+        t.onabort = () => reject(t.error ?? new Error("Local storage transaction aborted"));
         req.onerror = () => reject(req.error);
       }),
   );
@@ -161,6 +254,7 @@ function request<T>(
 async function deleteDatabase(): Promise<void> {
   const openDatabase = dbPromise;
   dbPromise = null;
+  lastWrite = null;
 
   try {
     (await openDatabase)?.close();
@@ -179,20 +273,122 @@ async function deleteDatabase(): Promise<void> {
 }
 
 export const persistence = {
-  getWorkspace(id: string) {
-    return request<WorkspaceRecord | undefined>("readonly", (s) => s.get(id));
+  async getWorkspace(id: string): Promise<WorkspaceRecord | undefined> {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([STORE, FILES], "readonly");
+      const metadata = tx.objectStore(STORE).get(id);
+      const documents = tx.objectStore(FILES).index("workspaceId").getAll(id);
+      tx.onabort = () => reject(tx.error ?? new Error("Could not read workspace"));
+      tx.oncomplete = () => {
+        const record = metadata.result as StoredWorkspace | undefined;
+        if (!record) {
+          resolve(undefined);
+          return;
+        }
+        const { fileIds, revision, ...workspace } = record;
+        const byId = new Map<string, PersistedFile>(
+          (documents.result as StoredFile[]).map(({ workspaceId: _id, ...file }) => [
+            file.id,
+            file,
+          ]),
+        );
+        const files = fileIds.map((fileId) => byId.get(fileId));
+        if (files.some((file) => !file)) {
+          reject(new Error("Workspace has a missing file"));
+          return;
+        }
+        lastWrite = {
+          id,
+          revision,
+          files: new Map([...byId].map(([key, file]) => [key, { ...file }])),
+        };
+        resolve({ ...workspace, files: files as PersistedFile[] });
+      };
+    });
   },
-  putWorkspace(w: WorkspaceRecord) {
-    return request<IDBValidKey>("readwrite", (s) => s.put(w)).then(() => {});
+  async putWorkspace(w: WorkspaceRecord): Promise<void> {
+    // Snapshot metadata before awaiting; callers may rename/move files in place.
+    const files = w.files.map((file) => ({ ...file }));
+    const { files: _files, ...metadata } = w;
+    const revision = crypto.randomUUID();
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([STORE, FILES, SUMMARIES], "readwrite");
+      const current = tx.objectStore(STORE).get(w.id);
+      current.onsuccess = () => {
+        try {
+          const previous = current.result as StoredWorkspace | undefined;
+          const cached =
+            lastWrite?.id === w.id && lastWrite.revision === previous?.revision
+              ? lastWrite.files
+              : undefined;
+          const fileStore = tx.objectStore(FILES);
+          const nextIds = new Set(files.map((file) => file.id));
+          for (const id of previous?.fileIds ?? []) {
+            if (!nextIds.has(id)) fileStore.delete([w.id, id]);
+          }
+          for (const file of files) {
+            if (!sameFile(cached?.get(file.id), file))
+              fileStore.put({ ...file, workspaceId: w.id });
+          }
+          tx.objectStore(STORE).put({
+            ...metadata,
+            fileIds: files.map((file) => file.id),
+            revision,
+          });
+          tx.objectStore(SUMMARIES).put(summaryOf({ ...w, files }));
+        } catch (error) {
+          tx.abort();
+          reject(error);
+        }
+      };
+      tx.onabort = () => reject(tx.error ?? new Error("Could not save workspace"));
+      tx.oncomplete = () => {
+        lastWrite = { id: w.id, revision, files: new Map(files.map((file) => [file.id, file])) };
+        resolve();
+      };
+    });
   },
-  deleteWorkspace(id: string) {
-    return request<undefined>("readwrite", (s) => s.delete(id)).then(() => {});
+  async deleteWorkspace(id: string): Promise<void> {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([STORE, FILES, SUMMARIES], "readwrite");
+      const cursor = tx.objectStore(FILES).index("workspaceId").openKeyCursor(id);
+      cursor.onsuccess = () => {
+        const row = cursor.result;
+        if (!row) return;
+        tx.objectStore(FILES).delete(row.primaryKey);
+        row.continue();
+      };
+      tx.objectStore(STORE).delete(id);
+      tx.objectStore(SUMMARIES).delete(id);
+      tx.onabort = () => reject(tx.error ?? new Error("Could not delete workspace"));
+      tx.oncomplete = () => {
+        if (lastWrite?.id === id) lastWrite = null;
+        resolve();
+      };
+    });
   },
-  listWorkspaces() {
-    return request<WorkspaceRecord[]>("readonly", (s) => s.getAll());
+  listWorkspaceSummaries() {
+    return request<WorkspaceSummary[]>("readonly", (s) => s.getAll(), SUMMARIES);
   },
-  clearAll() {
-    return request<undefined>("readwrite", (s) => s.clear()).then(() => {});
+  async listWorkspaces(): Promise<WorkspaceRecord[]> {
+    const list = await persistence.listWorkspaceSummaries();
+    const workspaces = await Promise.all(list.map((w) => persistence.getWorkspace(w.id)));
+    return workspaces.filter((w): w is WorkspaceRecord => !!w);
+  },
+  async clearAll(): Promise<void> {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([STORE, FILES, SUMMARIES], "readwrite");
+      for (const store of [STORE, FILES, SUMMARIES]) tx.objectStore(store).clear();
+      tx.onabort = () => reject(tx.error ?? new Error("Could not clear storage"));
+      tx.oncomplete = () => {
+        lastWrite = null;
+        resolve();
+      };
+    });
   },
   destroy() {
     return deleteDatabase();

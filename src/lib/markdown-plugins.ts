@@ -44,33 +44,29 @@ let katexPromise: Promise<Plugin> | null = null;
 let katexPlugin: Plugin | null = null;
 
 function loadHighlight(): Promise<Plugin> {
-  highlightPromise ??= import("rehype-highlight").then((m) => {
-    highlightPlugin = m.default;
-    return highlightPlugin;
-  });
+  highlightPromise ??= import("rehype-highlight")
+    .then((m) => {
+      highlightPlugin = m.default;
+      return highlightPlugin;
+    })
+    .catch((error) => {
+      highlightPromise = null;
+      throw error;
+    });
   return highlightPromise;
 }
 
 function loadKatex(): Promise<Plugin> {
-  katexPromise ??= import("rehype-katex").then((m) => {
-    katexPlugin = m.default;
-    return katexPlugin;
-  });
+  katexPromise ??= import("rehype-katex")
+    .then((m) => {
+      katexPlugin = m.default;
+      return katexPlugin;
+    })
+    .catch((error) => {
+      katexPromise = null;
+      throw error;
+    });
   return katexPromise;
-}
-
-/**
- * Fetch both plugins during idle time. Called once after the app has painted so
- * that opening a document finds them already resolved — the on-demand path pays
- * off on load, this keeps it from costing anything on interaction.
- */
-export function warmMarkdownPlugins(): void {
-  const start = () => {
-    void loadHighlight();
-    void loadKatex();
-  };
-  if (typeof requestIdleCallback === "function") requestIdleCallback(start, { timeout: 3000 });
-  else setTimeout(start, 800);
 }
 
 // Always-on plugins. Frozen module-level arrays: react-markdown re-parses when
@@ -95,11 +91,17 @@ export function useMarkdownPlugins(source: string, extraRemark: readonly Plugin[
 
     if (needs.code) {
       loadMonoFont();
-      if (!highlightPlugin) void loadHighlight().then(bump);
+      if (!highlightPlugin)
+        void loadHighlight()
+          .then(bump)
+          .catch(() => {});
     }
     if (needs.math) {
       loadKatexStyles();
-      if (!katexPlugin) void loadKatex().then(bump);
+      if (!katexPlugin)
+        void loadKatex()
+          .then(bump)
+          .catch(() => {});
     }
     return () => {
       alive = false;
@@ -118,7 +120,9 @@ export function useMarkdownPlugins(source: string, extraRemark: readonly Plugin[
     const list: Plugin[] = [...BASE_REHYPE];
     if (needs.math && katexPlugin) list.push(katexPlugin);
     if (needs.code && highlightPlugin) {
-      list.push([highlightPlugin, { detect: true, ignoreMissing: true }]);
+      // Unlabelled fences stay plain; trying every language on each block is
+      // expensive on long documents. Explicit language fences retain colours.
+      list.push([highlightPlugin, { detect: false, ignoreMissing: true }]);
     }
     return list;
     // `katexPlugin`/`highlightPlugin` are module state, not reactive values —
