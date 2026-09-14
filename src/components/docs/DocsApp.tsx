@@ -22,14 +22,12 @@ import {
 } from "@/hooks/use-nav-history";
 import { Sidebar, AddMenu, DEFAULT_VIEW, type SidebarView } from "./Sidebar";
 import { MarkdownViewer } from "./MarkdownViewer";
-import { PaneTabs } from "./PaneTabs";
 import { PaneDocument } from "./PaneDocument";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import {
   activeFileOf,
   closeTab,
   hydratePanes,
-  moveTab,
   openInPane,
   singlePane,
   splitPane,
@@ -305,30 +303,71 @@ export function DocsApp() {
     );
   }, []);
 
-  /** Show an already-open tab in its pane. */
-  const selectTab = useCallback((paneId: string, fileId: string) => {
-    setPaneLayout((layout) => openInPane(layout, fileId, paneId));
-  }, []);
+  /** Every document currently open, in the order the panes hold them. */
+  const openFileIds = useMemo(() => {
+    const seen: string[] = [];
+    for (const pane of paneLayout.panes) {
+      for (const id of pane.tabs) if (!seen.includes(id)) seen.push(id);
+    }
+    return seen;
+  }, [paneLayout]);
 
-  const closePaneTab = useCallback((paneId: string, fileId: string) => {
-    setPaneLayout((layout) => closeTab(layout, paneId, fileId));
-    markDirtyRef.current();
-  }, []);
-
-  /** Split a pane in two, the new one showing the same document to start with. */
-  const splitFromPane = useCallback((paneId: string) => {
-    setPaneLayout((layout) => splitPane(layout, paneId, null));
-    markDirtyRef.current();
-  }, []);
-
-  /** A tab was dragged onto a pane — from another pane, or reordered in place. */
-  const dropTabIntoPane = useCallback(
-    (fromPaneId: string, fileId: string, toPaneId: string, toIndex: number) => {
-      setPaneLayout((layout) => moveTab(layout, fromPaneId, fileId, toPaneId, toIndex));
-      markDirtyRef.current();
-    },
-    [],
+  /** What the side-by-side columns are showing, other than the focused one. */
+  const splitFileIds = useMemo(
+    () =>
+      paneLayout.panes
+        .filter((pane) => pane.id !== paneLayout.focusedPaneId)
+        .map((pane) => pane.activeTabId)
+        .filter((id): id is string => !!id),
+    [paneLayout],
   );
+
+  /** Put a document in a column beside the one being read. */
+  const openBeside = useCallback((fileId: string) => {
+    setPaneLayout((layout) => {
+      const from = layout.focusedPaneId ?? layout.panes[0]?.id;
+      if (!from) return openInPane(layout, fileId);
+      // Side by side means two columns, not a growing row of them. Once a
+      // second column exists it is where everything "beside" goes — otherwise
+      // reading three documents in turn would leave three narrowing panes
+      // nobody asked for.
+      const other = layout.panes.find((pane) => pane.id !== from);
+      if (other) return openInPane(layout, fileId, other.id);
+      return splitPane(layout, from, fileId);
+    });
+    markDirtyRef.current();
+  }, []);
+
+  /** Stop keeping a document open, wherever it is being shown. */
+  const closeOpenFile = useCallback((fileId: string) => {
+    setPaneLayout((layout) => {
+      let next = layout;
+      for (const pane of layout.panes) {
+        if (pane.tabs.includes(fileId)) next = closeTab(next, pane.id, fileId);
+      }
+      return next;
+    });
+    markDirtyRef.current();
+  }, []);
+
+  /**
+   * Close a whole pane, folding its documents back into the one beside it.
+   *
+   * The documents themselves stay open — they are listed in the sidebar, not
+   * owned by the pane — so closing a column is only ever about the layout.
+   */
+  const closePane = useCallback((paneId: string) => {
+    setPaneLayout((layout) => {
+      if (layout.panes.length <= 1) return layout;
+      const panes = layout.panes.filter((pane) => pane.id !== paneId);
+      const focusedPaneId = panes.some((p) => p.id === layout.focusedPaneId)
+        ? layout.focusedPaneId
+        : panes[0].id;
+      return { panes, focusedPaneId };
+    });
+    markDirtyRef.current();
+  }, []);
+
   // A just-created blank document: the viewer opens straight into its editor so
   // the reader can paste markdown in without hunting for the Edit button.
   const [autoEditFileId, setAutoEditFileId] = useState<string | null>(null);
@@ -2704,6 +2743,11 @@ flowchart LR
                 onDeleteForever={deleteForever}
                 onOpenSettings={openSettings}
                 onOpenSavedPage={openSavedPage}
+                openFileIds={openFileIds}
+                currentOpenFileId={activeFileId}
+                splitFileIds={splitFileIds}
+                onOpenBeside={openBeside}
+                onCloseOpenFile={closeOpenFile}
                 onAskAi={aiEnabled ? openAskAi : undefined}
                 onNewWorkspace={newWorkspace}
                 onImportWorkspace={importWorkspace}
@@ -2895,18 +2939,30 @@ flowchart LR
                             onMouseDown={() => focusPane(pane.id)}
                             className="flex h-full min-h-0 flex-col"
                           >
-                            <PaneTabs
-                              pane={pane}
-                              files={files}
-                              focused={pane.id === paneLayout.focusedPaneId}
-                              onSelect={(fileId) => selectTab(pane.id, fileId)}
-                              onClose={(fileId) => closePaneTab(pane.id, fileId)}
-                              onFocus={() => focusPane(pane.id)}
-                              onSplit={() => splitFromPane(pane.id)}
-                              onDropTab={(fromPaneId, fileId, toIndex) =>
-                                dropTabIntoPane(fromPaneId, fileId, pane.id, toIndex)
-                              }
-                            />
+                            {/* No tab strip. The open documents live in the
+                                sidebar; a pane is just a column of reading, and
+                                the only chrome it carries is a thin header
+                                saying which document it holds and how to close
+                                it. */}
+                            <div
+                              className={`flex h-9 shrink-0 items-center gap-2 border-b px-3 ${
+                                pane.id === paneLayout.focusedPaneId
+                                  ? "border-border bg-background"
+                                  : "border-border/60 bg-muted/20"
+                              }`}
+                            >
+                              <span className="min-w-0 flex-1 truncate text-xs font-medium text-muted-foreground">
+                                {paneFile ? paneFile.name.replace(/\.[^.]+$/, "") : "Empty"}
+                              </span>
+                              <button
+                                onClick={() => closePane(pane.id)}
+                                aria-label="Close this pane"
+                                title="Close this pane"
+                                className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                              >
+                                <X className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
                             <div className="min-h-0 flex-1 overflow-y-auto px-4">
                               {paneFile ? (
                                 <PaneDocument
@@ -2944,62 +3000,43 @@ flowchart LR
                 (activeFile.kind === "markdown" ||
                   activeFile.kind === "text" ||
                   !activeFile.kind) ? (
-                <>
-                  {/* The single pane gets the same tab strip the split does.
-                      Without it there would be no way to reach a split at all —
-                      the control that creates one lives on the strip. */}
-                  {paneLayout.panes[0] && (
-                    <PaneTabs
-                      pane={paneLayout.panes[0]}
-                      files={files}
-                      focused
-                      onSelect={(fileId) => selectTab(paneLayout.panes[0].id, fileId)}
-                      onClose={(fileId) => closePaneTab(paneLayout.panes[0].id, fileId)}
-                      onFocus={() => focusPane(paneLayout.panes[0].id)}
-                      onSplit={() => splitFromPane(paneLayout.panes[0].id)}
-                      onDropTab={(fromPaneId, fileId, toIndex) =>
-                        dropTabIntoPane(fromPaneId, fileId, paneLayout.panes[0].id, toIndex)
-                      }
-                    />
-                  )}
-                  <MarkdownViewer
-                    file={activeFile}
-                    prevFile={prevFile}
-                    nextFile={nextFile}
-                    onNav={navFromViewer}
-                    activeSubtopicId={activeHeadingId}
-                    highlightQuery={highlightQuery}
-                    onContentChange={handleContentChange}
-                    onEditorDirtyChange={(dirty) => {
-                      editorDirtyRef.current = dirty;
-                    }}
-                    startInEditFileId={autoEditFileId}
-                    onStartInEditConsumed={consumeStartInEdit}
-                    nextReadingMin={nextReadingMinutes}
-                    isBookmarked={!!activePageSaved}
-                    onToggleBookmark={toggleActivePageSaved}
-                    highlights={activeFileHighlights}
-                    onAddHighlight={addHighlightToActive}
-                    onUpdateHighlight={updateHighlight}
-                    onRemoveHighlight={removeHighlight}
-                    onRepairHighlights={repairHighlights}
-                    saved={activeFileSaved}
-                    onToggleSaved={toggleSavedOnActive}
-                    onRemoveSaved={removeSaved}
-                    pendingSaved={pendingSaved?.fileId === activeFile.id ? pendingSaved : null}
-                    onSavedShown={clearPendingSaved}
-                    onHome={goHome}
-                    onShareFile={shareActiveFile}
-                    onAskAi={aiEnabled ? askAiFromSelection : undefined}
-                    readingMode={readingMode}
-                    workspaceId={workspaceId}
-                    workspaceRevision={workspaceRevision}
-                    workspaceFiles={files}
-                    workspaceName={workspaceNameRef.current}
-                    onOpenArtifact={openEmbeddedArtifact}
-                    onOpenPalette={() => setPaletteOpen(true)}
-                  />
-                </>
+                <MarkdownViewer
+                  file={activeFile}
+                  prevFile={prevFile}
+                  nextFile={nextFile}
+                  onNav={navFromViewer}
+                  activeSubtopicId={activeHeadingId}
+                  highlightQuery={highlightQuery}
+                  onContentChange={handleContentChange}
+                  onEditorDirtyChange={(dirty) => {
+                    editorDirtyRef.current = dirty;
+                  }}
+                  startInEditFileId={autoEditFileId}
+                  onStartInEditConsumed={consumeStartInEdit}
+                  nextReadingMin={nextReadingMinutes}
+                  isBookmarked={!!activePageSaved}
+                  onToggleBookmark={toggleActivePageSaved}
+                  highlights={activeFileHighlights}
+                  onAddHighlight={addHighlightToActive}
+                  onUpdateHighlight={updateHighlight}
+                  onRemoveHighlight={removeHighlight}
+                  onRepairHighlights={repairHighlights}
+                  saved={activeFileSaved}
+                  onToggleSaved={toggleSavedOnActive}
+                  onRemoveSaved={removeSaved}
+                  pendingSaved={pendingSaved?.fileId === activeFile.id ? pendingSaved : null}
+                  onSavedShown={clearPendingSaved}
+                  onHome={goHome}
+                  onShareFile={shareActiveFile}
+                  onAskAi={aiEnabled ? askAiFromSelection : undefined}
+                  readingMode={readingMode}
+                  workspaceId={workspaceId}
+                  workspaceRevision={workspaceRevision}
+                  workspaceFiles={files}
+                  workspaceName={workspaceNameRef.current}
+                  onOpenArtifact={openEmbeddedArtifact}
+                  onOpenPalette={() => setPaletteOpen(true)}
+                />
               ) : activeFile ? (
                 <DocumentViewer
                   file={activeFile}

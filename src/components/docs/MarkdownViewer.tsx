@@ -1687,7 +1687,6 @@ function SavableBlock({
 }
 
 function HeadingLink({ as: Tag, children, id, highlight, ...rest }: any) {
-  const [copied, setCopied] = useState(false);
   const ctx = useContext(SavedContext);
   const collapse = useContext(CollapseContext);
   const text = Array.isArray(children)
@@ -1699,14 +1698,22 @@ function HeadingLink({ as: Tag, children, id, highlight, ...rest }: any) {
     : undefined;
   const collapsed = collapse?.isCollapsed(finalId) ?? false;
   return (
-    <Tag id={finalId} {...rest} className="group scroll-mt-24">
-      {/* Wrap/unwrap everything under this heading. A chevron rather than a
-          twisty on the margin: the heading itself is the control, so the hit
-          target is where the reader is already looking. */}
+    <Tag id={finalId} {...rest} className="group relative scroll-mt-24">
+      {/* Out in the margin, not in the text.
+          This used to sit inline before the heading, which put a control in the
+          middle of the prose on every single heading — permanent chrome the
+          reader had to read past. It lives to the left of the reading column
+          now and only appears when the heading is hovered or focused, so an
+          untouched page is just the document. A collapsed section keeps its
+          chevron visible regardless: that is the only way back. */}
       {collapse && (
         <button
           onClick={() => collapse.toggle(finalId)}
-          className="mr-1.5 inline-flex h-7 w-7 items-center justify-center align-middle rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          className={`absolute -left-7 top-1/2 hidden h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground focus-visible:opacity-100 md:flex ${
+            collapsed
+              ? "opacity-100"
+              : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
+          }`}
           aria-expanded={!collapsed}
           aria-controls={`${finalId}-section`}
           title={collapsed ? "Expand section" : "Collapse section"}
@@ -1732,22 +1739,6 @@ function HeadingLink({ as: Tag, children, id, highlight, ...rest }: any) {
           <Star className="h-4 w-4 fill-gold text-gold" />
         </button>
       )}
-      <button
-        onClick={() => {
-          const url = `${window.location.origin}${window.location.pathname}#${finalId}`;
-          navigator.clipboard.writeText(url);
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1500);
-        }}
-        className="ml-1 inline-flex h-9 w-9 items-center justify-center align-middle opacity-0 transition-opacity group-hover:opacity-100 [@media(hover:none)]:opacity-100"
-        aria-label="Copy link to heading"
-      >
-        {copied ? (
-          <Check className="h-4 w-4 text-primary" />
-        ) : (
-          <Link2 className="h-4 w-4 text-muted-foreground" />
-        )}
-      </button>
     </Tag>
   );
 }

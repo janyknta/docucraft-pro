@@ -36,6 +36,7 @@ import {
   Upload,
   CheckSquare,
   Share2,
+  X,
   Hash,
   Table,
   Code,
@@ -215,6 +216,23 @@ interface Props {
   onOpenSettings: (tab?: "workspace") => void;
   /** Open the Saved page, where stars and highlights live together. */
   onOpenSavedPage?: () => void;
+  /**
+   * Documents currently open, in the order they were opened.
+   *
+   * The reader's open documents live here rather than in a tab strip above the
+   * page: the sidebar already is the list of what this workspace holds, and a
+   * second list across the top of the reading column was the same information
+   * in a worse place.
+   */
+  openFileIds?: string[];
+  /** Which open document is on screen (in the focused column). */
+  currentOpenFileId?: string | null;
+  /** Ids that are showing in a side-by-side column right now. */
+  splitFileIds?: string[];
+  /** Put this document in a column beside the current one. */
+  onOpenBeside?: (fileId: string) => void;
+  /** Stop keeping this document open. */
+  onCloseOpenFile?: (fileId: string) => void;
   /** Open the Ask AI panel. When omitted, the Ask AI button is hidden. */
   onAskAi?: () => void;
   onNewWorkspace?: (name?: string) => void;
@@ -280,6 +298,11 @@ function SidebarImpl({
   onView,
   onOpenSettings,
   onOpenSavedPage,
+  openFileIds = [],
+  currentOpenFileId = null,
+  splitFileIds = [],
+  onOpenBeside,
+  onCloseOpenFile,
   onAskAi,
   onNewWorkspace,
   onImportWorkspace,
@@ -354,6 +377,9 @@ function SidebarImpl({
   // Folder currently being dragged, so a row is never offered as a drop target
   // for itself and the root zone doesn't light up under its own drag.
   const [draggingFolderId, setDraggingFolderId] = useState<string | null>(null);
+  // Document currently being dragged into (or out of) a folder. The top-level
+  // drop zone highlights only while one is in flight.
+  const [draggingFileId, setDraggingFileId] = useState<string | null>(null);
 
   // "Create" opens a small File/Folder menu; "view" picks what the list below
   // shows. Both are click-away dropdowns anchored to their own button.
@@ -689,6 +715,7 @@ function SidebarImpl({
                 ? (e) => {
                     e.dataTransfer.setData(FILE_DND, file.id);
                     e.dataTransfer.effectAllowed = "move";
+                    setDraggingFileId(file.id);
                   }
                 : undefined
           }
@@ -714,6 +741,7 @@ function SidebarImpl({
               ? () => {
                   endDrag();
                   setDropFolderId(null);
+                  setDraggingFileId(null);
                 }
               : undefined
           }
@@ -946,6 +974,84 @@ function SidebarImpl({
         </div>
       )}
 
+      {/* What is open right now, above what the workspace holds.
+          Two documents can be read side by side from here: "⫿" puts one in a
+          column beside the current one. This replaced a tab strip over the
+          reading column — the sidebar is already the list of documents, and a
+          second list above the page said the same thing in a worse place. */}
+      {openFileIds.length > 0 && (
+        <div className="shrink-0 px-3 pb-1 pt-3">
+          <div className="px-1 pb-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Open
+          </div>
+          <ul className="space-y-0.5">
+            {openFileIds.map((fileId) => {
+              const file = files.find((f) => f.id === fileId);
+              if (!file) return null;
+              const current = fileId === currentOpenFileId;
+              const beside = splitFileIds.includes(fileId);
+              const KindIcon = kindIcon(kindOf(file));
+              return (
+                <li
+                  key={fileId}
+                  className={`group flex items-center gap-1 rounded-lg px-1 ${
+                    current ? "bg-accent/60" : "hover:bg-accent/40"
+                  }`}
+                >
+                  <button
+                    onClick={() => onSelect(fileId)}
+                    className="flex min-w-0 flex-1 items-center gap-2 rounded-md py-1.5 pl-1.5 pr-1 text-left"
+                    aria-current={current ? "page" : undefined}
+                  >
+                    <KindIcon
+                      className={`h-3.5 w-3.5 shrink-0 ${
+                        current ? "text-primary" : "text-muted-foreground/70"
+                      }`}
+                      aria-hidden
+                    />
+                    <span
+                      className={`min-w-0 flex-1 truncate text-sm ${
+                        current ? "font-semibold text-foreground" : "text-foreground/80"
+                      }`}
+                    >
+                      {file.name.replace(/\.[^.]+$/, "")}
+                    </span>
+                    {beside && (
+                      <span
+                        className="shrink-0 text-[10px] font-medium text-primary"
+                        title="Showing in a side-by-side column"
+                      >
+                        ⫿
+                      </span>
+                    )}
+                  </button>
+                  {onOpenBeside && !beside && (
+                    <button
+                      onClick={() => onOpenBeside(fileId)}
+                      aria-label={`Open ${file.name} beside the current document`}
+                      title="Open beside"
+                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground md:opacity-0 md:group-hover:opacity-100"
+                    >
+                      <span className="text-sm leading-none">⫿</span>
+                    </button>
+                  )}
+                  {onCloseOpenFile && (
+                    <button
+                      onClick={() => onCloseOpenFile(fileId)}
+                      aria-label={`Close ${file.name}`}
+                      title="Close"
+                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground md:opacity-0 md:group-hover:opacity-100"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+
       <nav className="flex-1 overflow-y-auto px-3 pb-3">
         {reordering && !viewActive && (
           <div className="mb-2 flex items-center gap-2 rounded-lg border border-primary/30 bg-primary/10 px-2.5 py-2 text-xs text-primary">
@@ -1084,7 +1190,11 @@ function SidebarImpl({
                 real place to drop rather than dead pixels. */}
             <div
               className={`min-h-16 rounded-lg ${
-                showFolders && dropFolderId === null && draggingFolderId === null
+                // Only while something is actually being dragged. This used to
+                // test `dropFolderId === null`, which is the *resting* state —
+                // so the ring was drawn permanently, reading as a stray border
+                // around the unfiled files.
+                showFolders && draggingFileId !== null && dropFolderId === null
                   ? "ring-2 ring-primary/60"
                   : ""
               }`}

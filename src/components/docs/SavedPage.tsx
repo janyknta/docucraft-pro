@@ -1,18 +1,18 @@
 import { useMemo, useState } from "react";
-import { Highlighter, Star, Tag, Trash2, Unlink, X } from "lucide-react";
+import { Highlighter, Star, X } from "lucide-react";
 import { HL_COLORS, type Highlight } from "@/lib/dom-highlighter";
-import { savedTypeLabel, type SavedEntry, type SavedItem } from "@/lib/saved-items";
+import type { SavedEntry, SavedItem } from "@/lib/saved-items";
 
 /**
- * Everything the reader has kept, as a page rather than a list buried in
- * settings.
+ * Everything the reader has kept, as one continuous document.
  *
- * Stars and highlights were in two different places — one under a settings tab,
- * the other behind a per-file menu item — which made "the things I saved" a
- * thing you had to remember the location of. They are one surface here: note
- * cards grouped by document, with the highlight colours as a filter across the
- * top, so a reader who marks passages in yellow for one purpose and green for
- * another can pull up just one of them.
+ * Not a list of saved things — a page you *read*. The passages run together as
+ * prose in the same column the reader was in when they marked them, each one
+ * still wearing its highlight colour, under a heading per source document. A
+ * list of cards makes you scan; this makes you read, which is the point of
+ * having kept the passages in the first place.
+ *
+ * Clicking any passage goes back to it in its own document.
  */
 export function SavedPage({
   saved,
@@ -25,89 +25,65 @@ export function SavedPage({
 }: {
   saved: SavedEntry[];
   highlights: Highlight[];
-  /** Resolve a highlight's file id to its name, for grouping. */
+  /** Resolve a highlight's file id to its name, for the section headings. */
   fileName: (fileId: string) => string | null;
   onOpenSaved: (item: SavedItem) => void;
   onRemoveSaved: (id: string) => void;
   onOpenHighlight: (hl: Highlight) => void;
   onRemoveHighlight: (id: string) => void;
 }) {
-  // Which highlight colours are showing. Empty means "all of them" rather than
-  // "none": an untouched filter should never hide anything.
+  // Empty means "every colour", not "none": an untouched filter hides nothing.
   const [colors, setColors] = useState<Set<string>>(() => new Set());
-  const [kind, setKind] = useState<"all" | "stars" | "highlights">("all");
 
   const usedColors = useMemo(() => {
     const seen = new Set<string>();
     for (const hl of highlights) seen.add(hl.color);
-    // Ordered by the palette rather than by first appearance, so the row of
-    // swatches doesn't rearrange itself as the reader highlights more.
+    // Palette order, so the swatches don't rearrange as more get marked.
     return HL_COLORS.filter((c) => seen.has(c));
   }, [highlights]);
 
-  const visibleHighlights = useMemo(
-    () =>
-      kind === "stars" ? [] : highlights.filter((hl) => colors.size === 0 || colors.has(hl.color)),
-    [highlights, colors, kind],
+  const visible = useMemo(
+    () => highlights.filter((hl) => colors.size === 0 || colors.has(hl.color)),
+    [highlights, colors],
   );
-  const visibleSaved = kind === "highlights" ? [] : saved;
 
-  /** One bucket per document, holding both kinds of keepsake. */
-  const groups = useMemo(() => {
+  /** One section per source document, in the order the passages were kept. */
+  const sections = useMemo(() => {
     const byFile = new Map<
       string,
-      { name: string; saved: SavedEntry[]; highlights: Highlight[] }
+      { name: string; highlights: Highlight[]; saved: SavedEntry[] }
     >();
     const bucket = (fileId: string, name: string) => {
       let entry = byFile.get(fileId);
       if (!entry) {
-        entry = { name, saved: [], highlights: [] };
+        entry = { name, highlights: [], saved: [] };
         byFile.set(fileId, entry);
       }
       return entry;
     };
-    for (const item of visibleSaved) bucket(item.fileId, item.fileName).saved.push(item);
-    for (const hl of visibleHighlights) {
+    for (const hl of visible) {
       const name = fileName(hl.fileId);
       if (name) bucket(hl.fileId, name).highlights.push(hl);
     }
+    for (const item of saved) bucket(item.fileId, item.fileName).saved.push(item);
     return [...byFile.entries()].map(([fileId, entry]) => ({ fileId, ...entry }));
-  }, [visibleSaved, visibleHighlights, fileName]);
+  }, [visible, saved, fileName]);
 
-  const total = visibleSaved.length + visibleHighlights.length;
+  const nothing = visible.length === 0 && saved.length === 0;
 
   return (
-    <div className="mx-auto w-full max-w-3xl px-4 py-8 sm:px-6">
-      <header className="mb-6">
-        <h1 className="text-2xl font-bold tracking-tight text-foreground">Saved</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Stars and highlights, grouped by document.
+    <div className="mx-auto flex w-full max-w-4xl gap-8 px-6 py-10 md:px-10 md:py-16">
+      <article className="docs-prose mx-auto min-w-0 flex-1">
+        <h1>Saved</h1>
+        <p className="text-muted-foreground">
+          Everything you have highlighted and starred, in one place. Click any passage to open it
+          where it came from.
         </p>
-      </header>
 
-      {/* The filter pane. Kind first, then colour — a reader narrowing down
-          usually knows which of the two they are after before they know which
-          colour they used. */}
-      <div className="mb-6 space-y-3 rounded-xl border border-border bg-card p-3">
-        <div className="flex flex-wrap items-center gap-1.5">
-          {(["all", "stars", "highlights"] as const).map((option) => (
-            <button
-              key={option}
-              onClick={() => setKind(option)}
-              aria-pressed={kind === option}
-              className={`rounded-lg px-2.5 py-1 text-xs font-medium capitalize transition-colors ${
-                kind === option
-                  ? "bg-accent text-foreground"
-                  : "text-muted-foreground hover:text-foreground"
-              }`}
-            >
-              {option}
-            </button>
-          ))}
-        </div>
-
-        {usedColors.length > 0 && kind !== "stars" && (
-          <div className="flex flex-wrap items-center gap-2 border-t border-border pt-3">
+        {/* Colour filter. Quiet, above the reading, and gone entirely when
+            there is nothing marked in more than one colour. */}
+        {usedColors.length > 1 && (
+          <div className="not-prose my-6 flex flex-wrap items-center gap-2 border-y border-border py-3">
             <span className="text-xs text-muted-foreground">Colour</span>
             {usedColors.map((color) => {
               const on = colors.has(color);
@@ -148,112 +124,72 @@ export function SavedPage({
             )}
           </div>
         )}
-      </div>
 
-      {total === 0 ? (
-        <div className="rounded-xl border border-border bg-card px-4 py-16 text-center">
-          <Star className="mx-auto h-6 w-6 text-muted-foreground/60" />
-          <p className="mt-2 text-sm text-muted-foreground">
-            {colors.size > 0 || kind !== "all"
-              ? "Nothing matches this filter."
-              : "Nothing saved yet. Star a section, or highlight a passage while reading."}
+        {nothing ? (
+          <p className="not-prose flex items-center gap-2 py-16 text-sm text-muted-foreground">
+            <Highlighter className="h-4 w-4 shrink-0" />
+            {colors.size > 0
+              ? "Nothing in this colour."
+              : "Nothing saved yet. Highlight a passage while reading and it will appear here."}
           </p>
-        </div>
-      ) : (
-        <div className="space-y-6">
-          {groups.map((group) => (
-            <section key={group.fileId}>
-              <h2 className="mb-2 px-0.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                {group.name.replace(/\.[^.]+$/, "")}
-              </h2>
-              <div className="space-y-2">
-                {group.saved.map((item) => (
-                  <article
-                    key={item.id}
-                    className="group flex items-stretch gap-3 rounded-xl border border-border bg-card p-3 transition-colors hover:border-primary/40"
-                  >
-                    <Star className="mt-0.5 h-4 w-4 shrink-0 fill-gold text-gold" aria-hidden />
-                    <button onClick={() => onOpenSaved(item)} className="min-w-0 flex-1 text-left">
-                      <span className="block text-sm font-medium text-foreground">
-                        {item.title}
-                      </span>
-                      <span className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
-                        {savedTypeLabel(item)}
-                        {item.orphaned && (
-                          <span className="text-amber-600 dark:text-amber-400">· edited away</span>
-                        )}
-                      </span>
-                      {item.note && (
-                        <span className="mt-1.5 block whitespace-pre-wrap text-xs text-muted-foreground">
-                          {item.note}
-                        </span>
-                      )}
-                    </button>
-                    <button
-                      onClick={() => onRemoveSaved(item.id)}
-                      aria-label="Remove saved item"
-                      className="shrink-0 self-start rounded-md p-1.5 text-muted-foreground transition-colors hover:text-destructive md:opacity-0 md:group-hover:opacity-100"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </article>
-                ))}
+        ) : (
+          sections.map((section) => (
+            <section key={section.fileId}>
+              <h2>{section.name.replace(/\.[^.]+$/, "")}</h2>
 
-                {group.highlights.map((hl) => (
-                  <article
-                    key={hl.id}
-                    className="group flex items-stretch gap-3 rounded-xl border border-border bg-card p-3 transition-colors hover:border-primary/40"
+              {/* Starred sections read as a line of links under the heading —
+                  they point at a place in the document rather than carrying
+                  text of their own, so they are not prose to be read here. */}
+              {section.saved.length > 0 && (
+                <p className="not-prose mb-4 flex flex-wrap gap-x-3 gap-y-1 text-sm">
+                  {section.saved.map((item) => (
+                    <button
+                      key={item.id}
+                      onClick={() => onOpenSaved(item)}
+                      onAuxClick={(e) => {
+                        if (e.button === 1) onRemoveSaved(item.id);
+                      }}
+                      className="inline-flex items-center gap-1 text-muted-foreground transition-colors hover:text-foreground"
+                      title="Open this section"
+                    >
+                      <Star className="h-3 w-3 shrink-0 fill-gold text-gold" aria-hidden />
+                      {item.title}
+                    </button>
+                  ))}
+                </p>
+              )}
+
+              {section.highlights.map((hl) => (
+                <p key={hl.id}>
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => onOpenHighlight(hl)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") onOpenHighlight(hl);
+                    }}
+                    onAuxClick={(e) => {
+                      // Middle-click removes, so the reading surface needs no
+                      // delete button sitting beside every passage.
+                      if (e.button === 1) onRemoveHighlight(hl.id);
+                    }}
+                    className="cursor-pointer [box-decoration-break:clone]"
+                    style={{ backgroundColor: hl.color, color: "#0a0a0a", padding: "1px 3px" }}
+                    title="Open where this came from"
                   >
-                    <span
-                      className="w-1 shrink-0 rounded-full"
-                      style={{ backgroundColor: hl.color }}
-                      aria-hidden
-                    />
-                    <button
-                      onClick={() => onOpenHighlight(hl)}
-                      className="min-w-0 flex-1 text-left"
-                      title="Jump to this highlight"
-                    >
-                      <span
-                        className="text-sm leading-relaxed text-foreground [box-decoration-break:clone]"
-                        style={{ backgroundColor: hl.color, color: "#0a0a0a", padding: "1px 2px" }}
-                      >
-                        {hl.text}
-                      </span>
-                      {hl.label && (
-                        <span className="mt-1.5 flex items-center gap-1 text-xs text-muted-foreground">
-                          <Tag className="h-3 w-3 shrink-0" />
-                          {hl.label}
-                        </span>
-                      )}
-                      {hl.orphaned && (
-                        <span className="mt-1.5 flex items-center gap-1 text-xs text-amber-600 dark:text-amber-500">
-                          <Unlink className="h-3 w-3 shrink-0" />
-                          This text is no longer in the document
-                        </span>
-                      )}
-                    </button>
-                    <button
-                      onClick={() => onRemoveHighlight(hl.id)}
-                      aria-label="Remove highlight"
-                      className="shrink-0 self-start rounded-md p-1.5 text-muted-foreground transition-colors hover:text-destructive md:opacity-0 md:group-hover:opacity-100"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </article>
-                ))}
-              </div>
+                    {hl.text}
+                  </span>
+                  {hl.label && (
+                    <span className="ml-2 align-middle text-sm text-muted-foreground">
+                      — {hl.label}
+                    </span>
+                  )}
+                </p>
+              ))}
             </section>
-          ))}
-        </div>
-      )}
-
-      {highlights.length === 0 && saved.length > 0 && (
-        <p className="mt-6 flex items-center justify-center gap-1.5 text-xs text-muted-foreground">
-          <Highlighter className="h-3 w-3" />
-          Highlight a passage while reading and it will appear here too.
-        </p>
-      )}
+          ))
+        )}
+      </article>
     </div>
   );
 }
