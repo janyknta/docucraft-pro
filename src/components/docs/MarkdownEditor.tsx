@@ -53,13 +53,22 @@ interface Props {
   onCancel: (cursorIndex?: number) => void;
   /** Shown when "Inspect in source" couldn't pin the text to a source span. */
   inspectMissed?: boolean;
+  /**
+   * Fired whenever the draft starts or stops differing from what the editor
+   * opened with.
+   *
+   * The parent needs this to know whether leaving is destructive: navigating
+   * away from an untouched editor should be silent, and only a draft with real
+   * changes in it is worth stopping the reader for.
+   */
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 /** How long typing has to pause before the draft is handed to the parent. */
 const AUTOSAVE_MS = 500;
 
 function MarkdownEditorImpl(
-  { initialContent, fileId, onSave, onDone, onCancel, inspectMissed }: Props,
+  { initialContent, fileId, onSave, onDone, onCancel, inspectMissed, onDirtyChange }: Props,
   handleRef: React.Ref<MarkdownEditorHandle>,
 ) {
   // The draft and the document it belongs to are one piece of state, set
@@ -121,6 +130,21 @@ function MarkdownEditorImpl(
   // Set when the reader cancels, to stop the unmount flush below from writing
   // the abandoned draft back over the content the parent just restored.
   const cancelledRef = useRef(false);
+
+  // Tell the parent whether there is anything to lose. Held in a ref so an
+  // inline callback from the parent doesn't re-run this on every keystroke, and
+  // reported only on a transition rather than on every edit.
+  const onDirtyChangeRef = useRef(onDirtyChange);
+  onDirtyChangeRef.current = onDirtyChange;
+  const dirty = draft.fileId === fileId && draft.text !== initialContent;
+  useEffect(() => {
+    onDirtyChangeRef.current?.(dirty);
+  }, [dirty]);
+  // Leaving the editor entirely is not "unsaved work" — whatever happens on the
+  // way out (a flush, a cancel, a save) has already been decided by then.
+  useEffect(() => {
+    return () => onDirtyChangeRef.current?.(false);
+  }, []);
 
   // Autosave. Each of these re-renders the parent's file list, so the pause is
   // deliberately longer than a fast typist's gap between keystrokes.

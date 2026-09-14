@@ -38,6 +38,8 @@ const DocumentViewer = lazy(() =>
 const CommandPalette = lazy(() =>
   import("./CommandPalette").then((m) => ({ default: m.CommandPalette })),
 );
+const SavedPage = lazy(() => import("./SavedPage").then((m) => ({ default: m.SavedPage })));
+
 const SettingsPage = lazy(() =>
   import("./SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
@@ -46,15 +48,13 @@ const SettingsPage = lazy(() =>
  *  opens the dialog. DocsApp is the route component, so it remounts on the way
  *  to /settings and nothing held inside it survives to be read at mount. */
 let pendingSettingsTab: "workspace" | undefined;
-const HighlightsOnlyModal = lazy(() =>
-  import("./HighlightsOnlyModal").then((m) => ({ default: m.HighlightsOnlyModal })),
-);
 const AskAiPanel = lazy(() => import("./ai/AskAiPanel").then((m) => ({ default: m.AskAiPanel })));
 const SharedFilesDialog = lazy(() =>
   import("./SharedFilesDialog").then((m) => ({ default: m.SharedFilesDialog })),
 );
 import type { MdFile, MdChunk } from "@/lib/markdown-utils";
 import type { Highlight } from "@/lib/dom-highlighter";
+import { isBinExpired } from "@/lib/persistence";
 import { fileSubtopics, readingMinutes } from "@/lib/markdown-utils";
 import { getDocumentKind, importDocumentFile, SUPPORTED_ACCEPT } from "@/lib/document-utils";
 import { clearArtifactResolutionCache } from "@/lib/workspace-artifacts";
@@ -298,7 +298,6 @@ export function DocsApp() {
   } = useHistory<Highlight[]>([]);
   // File whose highlights are shown in isolation via the "Show highlights only"
   // menu item; null when the modal is closed.
-  const [highlightsOnlyFileId, setHighlightsOnlyFileId] = useState<string | null>(null);
   // Files arriving from a `#share-files=` link, held until the reader picks
   // between a new workspace and the one they already have open.
   const [incomingShare, setIncomingShare] = useState<SharedFilesPayload | null>(null);
@@ -314,6 +313,10 @@ export function DocsApp() {
   const location = useLocation();
   const navigate = useNavigate();
   const showSettings = location.pathname === "/settings";
+  // Saved is a page of its own rather than a tab inside settings: it is
+  // something the reader comes back to and reads, not a preference they set
+  // once. Settings keeps only the clear-everything control.
+  const showSaved = location.pathname === "/saved";
 
   // Navigation history. Owned here because this is where every destination —
   // the route, the open file, the section, the search term — actually lives.
@@ -696,7 +699,12 @@ export function DocsApp() {
         });
       }
 
-      setFiles(parsed);
+      // Sweep the Bin on the way in. There is no background process in a
+      // local-first app, so "deletes after 30 days" means the next time the
+      // workspace is opened past that mark — which is also the only moment the
+      // reader could have noticed it still being there.
+      const swept = parsed.filter((f) => !isBinExpired(f.deletedAt));
+      setFiles(swept);
       setFolders(wsFolders);
       setAutoEditFileId(null);
       setActiveFileId(ws.ui?.activeFileId ?? parsed[0]?.id ?? null);
@@ -1055,8 +1063,24 @@ export function DocsApp() {
   const pathnameRef = useRef(location.pathname);
   pathnameRef.current = location.pathname;
 
+  /**
+   * Whether the open editor holds unsaved changes, reported by the viewer.
+   *
+   * Navigation asks this before it moves. Only a genuinely changed draft
+   * prompts — leaving an untouched editor stays silent, which is what keeps the
+   * prompt meaningful when it does appear.
+   */
+  const editorDirtyRef = useRef(false);
+  const confirmDiscardDraft = useCallback((fileId?: string) => {
+    // Re-opening the document already on screen is not leaving it.
+    if (!editorDirtyRef.current) return true;
+    if (fileId && fileId === activeFileIdRef.current) return true;
+    return window.confirm("This document has unsaved changes. Leave and discard them?");
+  }, []);
+
   const handleSelect = useCallback(
     (fileId: string, headingId?: string, query?: string) => {
+      if (!confirmDiscardDraft(fileId)) return;
       setActiveFileId(fileId);
       if (query !== undefined) setHighlightQuery(query || null);
 
@@ -1126,13 +1150,43 @@ export function DocsApp() {
     [markDirty],
   );
 
-  const toggleArchiveFile = useCallback(
+  /**
+   * Send a document to the Bin, or bring it back.
+   *
+   * This replaced a separate Archive and Delete. Two ways to make a file
+   * disappear, one of them irreversible and the other easy to mistake for it,
+   * is one way too many: binning is the single gesture, and it is undoable for
+   * thirty days from a place the reader can actually find.
+   */
+  const moveToBin = useCallback(
     (id: string) => {
-      setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, isArchived: !f.isArchived } : f)));
+      setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, deletedAt: Date.now() } : f)));
       markDirty();
     },
     [markDirty],
   );
+
+  const restoreFromBin = useCallback(
+    (id: string) => {
+      setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, deletedAt: null } : f)));
+      markDirty();
+    },
+    [markDirty],
+  );
+
+  /** Delete for good — from the Bin, where the reader has already been warned. */
+  const deleteForever = useCallback(
+    (id: string) => {
+      setFiles((prev) => prev.filter((f) => f.id !== id));
+      markDirty();
+    },
+    [markDirty],
+  );
+
+  const emptyBin = useCallback(() => {
+    setFiles((prev) => prev.filter((f) => !f.deletedAt));
+    markDirty();
+  }, [markDirty]);
 
   const downloadFile = useCallback((id: string) => {
     const file = filesRef.current.find((f) => f.id === id);
@@ -2004,16 +2058,6 @@ flowchart LR
     if (activeFile) toggleSaved(activeFile.id, { kind: "file", title: activeFile.name });
   }, [toggleSaved, activeFile]);
 
-  // Star / unstar any document from its sidebar row, not just the open one —
-  // the header no longer carries a star.
-  const toggleFileStar = useCallback(
-    (fileId: string) => {
-      const file = filesRef.current.find((f) => f.id === fileId);
-      if (file) toggleSaved(fileId, { kind: "file", title: file.name });
-    },
-    [toggleSaved],
-  );
-
   // The collapsed rail's "New folder" — the expanded sidebar asks for the name
   // itself, so the rail has to do the same before it can create one.
   const promptNewFolderFromRail = useCallback(() => {
@@ -2093,6 +2137,13 @@ flowchart LR
     },
     [navigate],
   );
+
+  /** Open the Saved page — a real route, so it is linkable and in the trail. */
+  const openSavedPage = useCallback(() => {
+    navigate({ to: "/saved" });
+    navHistoryRef.current.push({ path: "/saved", fileId: null, headingId: null });
+    setDrawerOpen(false);
+  }, [navigate]);
 
   // Closing the dialog is a route change back to the reader. Going through the
   // trail rather than straight to "/" keeps whatever document was open, and
@@ -2181,14 +2232,6 @@ flowchart LR
       close: () => setPaletteOpen(false),
     });
   }, [paletteOpen, registerEscape]);
-  useEffect(() => {
-    if (!highlightsOnlyFileId) return;
-    return registerEscape({
-      id: "highlights-only",
-      depth: ESCAPE_DEPTH.overlay,
-      close: () => setHighlightsOnlyFileId(null),
-    });
-  }, [highlightsOnlyFileId, registerEscape]);
 
   // The browser's own back/gesture is the same intent as the header's back, so
   // it runs the same code — including closing an open mode first. `popstate`
@@ -2336,6 +2379,20 @@ flowchart LR
     </Suspense>
   ) : null;
 
+  const savedPage = showSaved ? (
+    <Suspense fallback={null}>
+      <SavedPage
+        saved={savedEntries}
+        highlights={highlights}
+        fileName={(fileId) => filesRef.current.find((f) => f.id === fileId)?.name ?? null}
+        onOpenSaved={openSaved}
+        onRemoveSaved={removeSaved}
+        onOpenHighlight={(hl) => handleSelect(hl.fileId, hl.subtopicId || undefined)}
+        onRemoveHighlight={removeHighlight}
+      />
+    </Suspense>
+  ) : null;
+
   // Settings is a dialog over the reader rather than a page of its own, so the
   // document stays visible behind it and closing it returns you to exactly what
   // you were reading. `/settings` stays a real route so the deep link still
@@ -2377,7 +2434,9 @@ flowchart LR
         onSetDiagramColors={setDiagramColors}
         aiEnabled={aiEnabled}
         onSetAiEnabled={setAiEnabled}
-        onToggleArchiveFile={toggleArchiveFile}
+        onRestoreFromBin={restoreFromBin}
+        onDeleteForever={deleteForever}
+        onEmptyBin={emptyBin}
         onImportWorkspace={importWorkspace}
         onExportWorkspace={exportWorkspace}
         onShareWorkspace={shareWorkspace}
@@ -2512,14 +2571,12 @@ flowchart LR
                 onToggleFile={toggleFile}
                 onSelect={handleSelect}
                 onAddFiles={() => inputRef.current?.click()}
-                onRemoveFile={removeFile}
-                onArchiveFile={toggleArchiveFile}
+                onRemoveFile={moveToBin}
                 onDownloadFile={downloadFile}
                 onShareFile={shareFile}
                 onShareFiles={(ids) => void shareFiles(ids)}
                 onRenameFile={renameFile}
                 onEditFile={editFile}
-                onToggleFileStar={toggleFileStar}
                 folders={folders}
                 onCreateFile={createFile}
                 onCreateMermaid={createMermaidFile}
@@ -2549,8 +2606,10 @@ flowchart LR
                 onClearStorage={clearAllStorage}
                 highlights={highlights}
                 onRemoveHighlight={removeHighlight}
-                onShowHighlights={setHighlightsOnlyFileId}
+                onRestoreFromBin={restoreFromBin}
+                onDeleteForever={deleteForever}
                 onOpenSettings={openSettings}
+                onOpenSavedPage={openSavedPage}
                 onAskAi={aiEnabled ? openAskAi : undefined}
                 onNewWorkspace={newWorkspace}
                 onImportWorkspace={importWorkspace}
@@ -2645,14 +2704,12 @@ flowchart LR
                     onToggleFile={toggleFile}
                     onSelect={handleSelect}
                     onAddFiles={() => inputRef.current?.click()}
-                    onRemoveFile={removeFile}
-                    onArchiveFile={toggleArchiveFile}
+                    onRemoveFile={moveToBin}
                     onDownloadFile={downloadFile}
                     onShareFile={shareFile}
                     onShareFiles={(ids) => void shareFiles(ids)}
                     onRenameFile={renameFile}
                     onEditFile={editFile}
-                    onToggleFileStar={toggleFileStar}
                     folders={folders}
                     onCreateFile={createFile}
                     onCreateMermaid={createMermaidFile}
@@ -2682,10 +2739,8 @@ flowchart LR
                     onClearStorage={clearAllStorage}
                     highlights={highlights}
                     onRemoveHighlight={removeHighlight}
-                    onShowHighlights={(id) => {
-                      setHighlightsOnlyFileId(id);
-                      setDrawerOpen(false);
-                    }}
+                    onRestoreFromBin={restoreFromBin}
+                    onDeleteForever={deleteForever}
                     onOpenSettings={(tab) => {
                       setDrawerOpen(false);
                       openSettings(tab);
@@ -2723,8 +2778,14 @@ flowchart LR
             so the common case never suspends here. */}
           <Suspense fallback={<main className="min-w-0 flex-1" aria-busy />}>
             <main className="min-w-0 flex-1 pb-[max(1.5rem,env(safe-area-inset-bottom))] lg:pb-0">
-              {activeFile &&
-              (activeFile.kind === "markdown" || activeFile.kind === "text" || !activeFile.kind) ? (
+              {/* Saved is a page, not an overlay: it takes the content column
+                  instead of stacking on top of whatever document was open. */}
+              {showSaved ? (
+                savedPage
+              ) : activeFile &&
+                (activeFile.kind === "markdown" ||
+                  activeFile.kind === "text" ||
+                  !activeFile.kind) ? (
                 <MarkdownViewer
                   file={activeFile}
                   prevFile={prevFile}
@@ -2733,6 +2794,9 @@ flowchart LR
                   activeSubtopicId={activeHeadingId}
                   highlightQuery={highlightQuery}
                   onContentChange={handleContentChange}
+                  onEditorDirtyChange={(dirty) => {
+                    editorDirtyRef.current = dirty;
+                  }}
                   startInEditFileId={autoEditFileId}
                   onStartInEditConsumed={consumeStartInEdit}
                   nextReadingMin={nextReadingMinutes}
@@ -2788,35 +2852,6 @@ flowchart LR
             e.target.value = "";
           }}
         />
-        {highlightsOnlyFileId &&
-          (() => {
-            const hlFile = files.find((f) => f.id === highlightsOnlyFileId);
-            if (!hlFile) return null;
-            const hlFileChunks = fileSubtopics(hlFile);
-            const chunkOrder = new Map(hlFileChunks.map((c, i) => [c.id, i]));
-            const fileHighlights = highlights
-              .filter((h) => h.fileId === hlFile.id)
-              .sort((a, b) => {
-                const aChunkIndex = chunkOrder.get(a.subtopicId ?? "") ?? -1;
-                const bChunkIndex = chunkOrder.get(b.subtopicId ?? "") ?? -1;
-                if (aChunkIndex !== bChunkIndex) return aChunkIndex - bChunkIndex;
-                return (a.start ?? 0) - (b.start ?? 0);
-              });
-            return (
-              <Suspense fallback={null}>
-                <HighlightsOnlyModal
-                  fileName={hlFile.name}
-                  highlights={fileHighlights}
-                  onClose={() => setHighlightsOnlyFileId(null)}
-                  onJump={(hl: Highlight) => {
-                    setHighlightsOnlyFileId(null);
-                    handleSelect(hl.fileId, hl.subtopicId || undefined);
-                  }}
-                  onRemove={removeHighlight}
-                />
-              </Suspense>
-            );
-          })()}
 
         {/* Mounted only once opened. The panel is a large component whose props
           are derived from every document in the workspace; keeping it out of

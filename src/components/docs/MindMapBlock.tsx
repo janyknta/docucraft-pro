@@ -1,6 +1,6 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { Expand, Minimize2 } from "lucide-react";
-import { buildMindMap } from "@/lib/mindmap";
+import { buildMindMap, type MindMapNode } from "@/lib/mindmap";
 
 /**
  * A ```mindmap fence in a markdown document, rendered the way ```mermaid is.
@@ -12,6 +12,13 @@ import { buildMindMap } from "@/lib/mindmap";
  */
 const MindMapView = lazy(() =>
   import("./MindMapView").then((module) => ({ default: module.MindMapView })),
+);
+
+// Behind the same boundary as the map itself: a document that never draws one
+// never downloads either, and by the time a node can be selected the module is
+// already loaded.
+const Inspector = lazy(() =>
+  import("./MindMapView").then((module) => ({ default: module.Inspector })),
 );
 
 /** Holds the map's rough footprint so surrounding text doesn't jump. */
@@ -84,6 +91,14 @@ export function MindMapBlock({ code, title }: { code: string; title?: string }) 
 function MindMapFigure({ tree }: { tree: NonNullable<ReturnType<typeof buildMindMap>> }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const [full, setFull] = useState(false);
+  // The details panel for the selected node, lifted out of the map.
+  //
+  // Inside the embed it sat on top of the drawing, and the embed is only a few
+  // hundred pixels tall — opening a node covered the thing the reader had just
+  // clicked. Hoisted here it sits at the figure's top right, beside the map
+  // rather than over it. In full screen there is room for it in place, so it
+  // goes back to being the map's own panel.
+  const [inspected, setInspected] = useState<MindMapNode | null>(null);
 
   // Driven by the event, not by the click: Escape and the browser's own exit
   // leave fullscreen without going through the button, and the state has to
@@ -118,13 +133,24 @@ function MindMapFigure({ tree }: { tree: NonNullable<ReturnType<typeof buildMind
           {full ? <Minimize2 className="h-3.5 w-3.5" /> : <Expand className="h-3.5 w-3.5" />}
         </button>
       </div>
-      <div className={full ? "min-h-0 flex-1" : ""}>
+      <div className={`relative ${full ? "min-h-0 flex-1" : ""}`}>
         <Suspense fallback={<MapPlaceholder />}>
           {/* Bounded height: inside a document the map is a figure, not a page,
               and it must not grow past the text it belongs to. Full screen is
               the exception, and there it fills what it is given. */}
-          <MindMapView tree={tree} embedded={!full} />
+          <MindMapView tree={tree} embedded={!full} onInspect={full ? undefined : setInspected} />
         </Suspense>
+        {!full && inspected && (
+          <div className="pointer-events-none absolute inset-0 z-10">
+            <div className="pointer-events-auto">
+              {/* Its own boundary: this sits outside the map's Suspense, and a
+                  lazy component with nothing to catch it throws on first use. */}
+              <Suspense fallback={null}>
+                <Inspector node={inspected} onClose={() => setInspected(null)} />
+              </Suspense>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

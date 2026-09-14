@@ -20,6 +20,24 @@ export interface PersistedFile {
   kind?: import("./markdown-utils").DocumentKind;
   /** Sidebar folder this file is filed under; null/undefined = top level. */
   folderId?: string | null;
+  /**
+   * Epoch ms the file was moved to the Bin, or null/undefined when it is live.
+   *
+   * The Bin replaced a separate Archive and Delete: one reversible action, with
+   * the reversal window written down rather than implied. Anything older than
+   * BIN_RETENTION_MS is purged when the workspace loads — there is no
+   * background process in a local-first app, so "30 days" means "swept the next
+   * time the app is opened after 30 days".
+   */
+  deletedAt?: number | null;
+}
+
+/** How long a binned document is recoverable before it is purged. */
+export const BIN_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** True when a binned file has outlived the recovery window. */
+export function isBinExpired(deletedAt: number | null | undefined, now = Date.now()): boolean {
+  return typeof deletedAt === "number" && now - deletedAt >= BIN_RETENTION_MS;
 }
 
 /**

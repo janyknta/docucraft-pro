@@ -120,10 +120,17 @@ function edgePath({ from, to }: Edge) {
 export function MindMapView({
   tree,
   embedded = false,
+  onInspect,
 }: {
   tree: MindMapTree;
   /** Rendered inside a document: a figure sized to the text, not a full page. */
   embedded?: boolean;
+  /**
+   * Hand the selected node to the caller instead of drawing the details panel
+   * inside the map. Passed when the map is a figure in a document, where the
+   * panel belongs outside the embed rather than on top of it.
+   */
+  onInspect?: (node: MindMapNode | null) => void;
 }) {
   const [open, setOpen] = useState<Set<string>>(() =>
     openToDepth(tree.root, initialOpenDepth(tree)),
@@ -141,6 +148,14 @@ export function MindMapView({
     const node = nodes.find(({ node }) => node.id === selected)?.node;
     return node?.metadata?.length ? node : null;
   }, [nodes, selected]);
+
+  // Keep the hoisted panel in step with the selection. The callback is held in
+  // a ref so a caller passing an inline arrow doesn't re-fire this every render.
+  const onInspectRef = useRef(onInspect);
+  onInspectRef.current = onInspect;
+  useEffect(() => {
+    onInspectRef.current?.(selectedNode);
+  }, [selectedNode]);
   useEffect(() => {
     const element = frameRef.current;
     if (!element) return;
@@ -271,7 +286,13 @@ export function MindMapView({
           <Home className="h-3.5 w-3.5" />
         </Control>
       </div>
-      {selectedNode && <Inspector node={selectedNode} onClose={() => setSelected(null)} />}
+      {/* Embedded in a document the inspector is hoisted out of the figure by
+          the caller (see `onInspect`), because the embed is only a few hundred
+          pixels tall and a panel inside it covers the map it describes. On the
+          full-page map there is room, so it stays where it is drawn. */}
+      {selectedNode && !onInspect && (
+        <Inspector node={selectedNode} onClose={() => setSelected(null)} />
+      )}
     </div>
   );
 }
@@ -295,7 +316,7 @@ function Control({
     </button>
   );
 }
-function Inspector({ node, onClose }: { node: MindMapNode; onClose: () => void }) {
+export function Inspector({ node, onClose }: { node: MindMapNode; onClose: () => void }) {
   const metadata = node.metadata ?? [];
   const description = metadata.find(({ label }) => /^(description|summary|details?)$/i.test(label));
   const attributes = metadata.filter((entry) => entry !== description);

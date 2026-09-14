@@ -40,6 +40,7 @@ import {
   Download,
   Expand,
   Minimize2,
+  ChevronDown,
 } from "lucide-react";
 import type { MdFile } from "@/lib/markdown-utils";
 import type { ReadingMode } from "@/lib/persistence";
@@ -105,6 +106,14 @@ interface Props {
   activeSubtopicId: string | null;
   highlightQuery: string | null;
   onContentChange: (fileId: string, content: string) => void;
+  /**
+   * Reports whether the open editor holds changes that leaving would discard.
+   *
+   * The viewer cannot veto a switch on its own — by the time a new `file` prop
+   * arrives the parent has already moved — so the parent keeps this flag and
+   * asks before it navigates.
+   */
+  onEditorDirtyChange?: (dirty: boolean) => void;
   /**
    * Id of a file that should open straight in the editor — a document the
    * reader just created from the sidebar, so pasting markdown is the first
@@ -192,6 +201,20 @@ interface SavedContextValue {
 
 const SavedContext = createContext<SavedContextValue | null>(null);
 
+/**
+ * Which sections the reader has wrapped up, shared between a heading and the
+ * content beneath it.
+ *
+ * Collapsing is a property of the rendered document rather than of any one
+ * element: the heading owns the control, but what it hides is its *siblings*,
+ * up to the next heading of the same or higher rank. Both sides read this.
+ */
+interface CollapseContextValue {
+  isCollapsed: (headingId: string) => boolean;
+  toggle: (headingId: string) => void;
+}
+const CollapseContext = createContext<CollapseContextValue | null>(null);
+
 function MarkdownViewerImpl({
   file,
   prevFile,
@@ -200,6 +223,7 @@ function MarkdownViewerImpl({
   activeSubtopicId,
   highlightQuery,
   onContentChange,
+  onEditorDirtyChange,
   startInEditFileId,
   onStartInEditConsumed,
   nextReadingMin,
@@ -470,6 +494,25 @@ function MarkdownViewerImpl({
   // item records which page it came from so the two spaces never mix — the same
   // rule persistent highlights follow.
   const savedSubtopicId = singleMode ? undefined : activeChunk.id;
+  // Sections the reader has wrapped up, by heading id. Cleared on a document
+  // switch: the ids belong to the document that was open.
+  const [collapsedSections, setCollapsedSections] = useState<Set<string>>(() => new Set());
+  useEffect(() => setCollapsedSections(new Set()), [file.id]);
+
+  const collapseCtx = useMemo<CollapseContextValue>(
+    () => ({
+      isCollapsed: (headingId) => collapsedSections.has(headingId),
+      toggle: (headingId) =>
+        setCollapsedSections((previous) => {
+          const next = new Set(previous);
+          if (next.has(headingId)) next.delete(headingId);
+          else next.add(headingId);
+          return next;
+        }),
+    }),
+    [collapsedSections],
+  );
+
   const savedCtx = useMemo<SavedContextValue>(
     () => ({
       containerRef: contentRef,
@@ -546,6 +589,36 @@ function MarkdownViewerImpl({
   // rendered text under the pointer, find where it lives in the markdown
   // source, and drop the editor's caret on it, selected and scrolled into view.
   const editorRef = useRef<MarkdownEditorHandle>(null);
+  // Whether the open editor holds changes that leaving would throw away.
+  const [editorDirty, setEditorDirty] = useState(false);
+
+  /**
+   * Stop a document switch from silently throwing away an open draft.
+   *
+   * The editor autosaves, so most navigation is safe — but a draft typed inside
+   * the debounce window, or one the reader is midway through and does not want,
+   * has no other moment to be asked about. Only a genuinely changed draft
+   * prompts: leaving an untouched editor stays silent, which is what makes the
+   * prompt mean something when it does appear.
+   */
+  const editorDirtyRef = useRef(false);
+  editorDirtyRef.current = editorDirty;
+
+  // Published upwards, where navigation can act on it. Held in a ref so an
+  // inline callback from the parent doesn't re-fire this on every render.
+  const onEditorDirtyChangeRef = useRef(onEditorDirtyChange);
+  onEditorDirtyChangeRef.current = onEditorDirtyChange;
+  useEffect(() => {
+    onEditorDirtyChangeRef.current?.(editorDirty);
+  }, [editorDirty]);
+  // Unmounting the viewer ends any unsaved state it was reporting.
+  useEffect(() => {
+    return () => onEditorDirtyChangeRef.current?.(false);
+  }, []);
+  const confirmLeaveEditor = useCallback(() => {
+    if (!editorDirtyRef.current) return true;
+    return window.confirm("This document has unsaved changes. Leave and discard them?");
+  }, []);
   const [pendingSelect, setPendingSelect] = useState<{ start: number; end: number } | null>(null);
   const [inspectMissed, setInspectMissed] = useState(false);
 
@@ -881,15 +954,68 @@ function MarkdownViewerImpl({
     return children;
   };
 
+  /**
+   * Whether the element currently being rendered sits under a collapsed
+   * heading.
+   *
+   * react-markdown hands each block to its own component with no notion of
+   * where it sits relative to the headings around it — the document arrives as
+   * a flat list of siblings. So the walk is tracked here: every heading records
+   * its own rank and id, and every block in between asks whether any heading
+   * still "open" above it is collapsed. A heading of equal or higher rank ends
+   * the previous section, which is what makes an H3 fold without swallowing the
+   * H2 that follows it.
+   *
+   * Reset per render pass, because that is exactly the order the blocks are
+   * rendered in.
+   */
+  const sectionWalk = useRef<{ rank: number; id: string }[]>([]);
+  sectionWalk.current = [];
+
+  const enterHeading = (rank: number, id: string) => {
+    const stack = sectionWalk.current;
+    while (stack.length && stack[stack.length - 1].rank >= rank) stack.pop();
+    stack.push({ rank, id });
+  };
+  /**
+   * True when any heading above this block is folded.
+   *
+   * `maxRank` excludes the caller's own level and everything below it, which is
+   * what keeps a folded heading on screen: a heading asks only about its
+   * *ancestors*, so it never hides itself and the chevron that unfolds it
+   * survives. Ordinary blocks pass no rank and are hidden by any folded heading
+   * above them.
+   */
+  const underCollapsed = (maxRank = Infinity) =>
+    sectionWalk.current.some((entry) => entry.rank < maxRank && collapsedSections.has(entry.id));
+
+  /** Wrap a block component so it disappears while its section is folded. */
+  const foldable = (render: (p: any) => React.ReactNode) => (p: any) =>
+    underCollapsed() ? null : render(p);
+
+  const heading = (rank: number, as: string) => (p: any) => {
+    const text = Array.isArray(p.children)
+      ? p.children.map((c: any) => (typeof c === "string" ? c : "")).join("")
+      : String(p.children ?? "");
+    const id = p.id || slugify(text);
+    // Asked before this heading joins the walk, and only about levels above it:
+    // a heading folded by the reader must keep rendering, or the control that
+    // unfolds it disappears along with its section.
+    const hidden = underCollapsed(rank);
+    enterHeading(rank, id);
+    if (hidden) return null;
+    return <HeadingLink as={as} {...p} highlight={highlightText} />;
+  };
+
   const components = useMemo(
     () => ({
-      h1: (p: any) => <HeadingLink as="h1" {...p} highlight={highlightText} />,
-      h2: (p: any) => <HeadingLink as="h2" {...p} highlight={highlightText} />,
-      h3: (p: any) => <HeadingLink as="h3" {...p} highlight={highlightText} />,
-      h4: (p: any) => <HeadingLink as="h4" {...p} highlight={highlightText} />,
-      h5: (p: any) => <HeadingLink as="h5" {...p} highlight={highlightText} />,
-      h6: (p: any) => <HeadingLink as="h6" {...p} highlight={highlightText} />,
-      p: (p: any) => {
+      h1: heading(1, "h1"),
+      h2: heading(2, "h2"),
+      h3: heading(3, "h3"),
+      h4: heading(4, "h4"),
+      h5: heading(5, "h5"),
+      h6: heading(6, "h6"),
+      p: foldable((p: any) => {
         // Rich embed detection: a paragraph that is a single bare autolink.
         // Match on props.href rather than element type — the custom `a`
         // override makes the child's type the component, not the string "a".
@@ -921,13 +1047,13 @@ function MarkdownViewerImpl({
           }
         }
         return <p {...p}>{walkChildren(p.children)}</p>;
-      },
-      blockquote: (p: any) => (
+      }),
+      blockquote: foldable((p: any) => (
         <SavableBlock blockType="quote">
           <Callout {...p} />
         </SavableBlock>
-      ),
-      pre: (p: any) => {
+      )),
+      pre: foldable((p: any) => {
         const codeEl = Array.isArray(p.children) ? p.children[0] : p.children;
         const cls = codeEl?.props?.className ?? "";
         const isMermaid = typeof cls === "string" && /language-mermaid/.test(cls);
@@ -945,8 +1071,8 @@ function MarkdownViewerImpl({
             <CodeBlock {...p} />
           </SavableBlock>
         );
-      },
-      img: (p: any) => {
+      }),
+      img: foldable((p: any) => {
         if (isArtifactUrl(p.src)) {
           return (
             <InlineArtifact
@@ -978,7 +1104,7 @@ function MarkdownViewerImpl({
             />
           </SavableBlock>
         );
-      },
+      }),
       a: (p: any) => {
         const href = typeof p.href === "string" ? p.href : "";
         // An in-page reference (`[see](#recommended-controls)`) used to be left
@@ -1017,21 +1143,33 @@ function MarkdownViewerImpl({
         );
       },
       li: (p: any) => <li {...p}>{walkChildren(p.children)}</li>,
-      table: (p: any) => (
+      table: foldable((p: any) => (
         <SavableBlock blockType="table" className="docs-savable-table">
           <div className="docs-table-wrap">
             <table {...p} />
           </div>
         </SavableBlock>
-      ),
+      )),
       td: (p: any) => <td {...p}>{walkChildren(p.children)}</td>,
       th: (p: any) => <th {...p}>{walkChildren(p.children)}</th>,
     }),
     // `highlights` is deliberately absent: nothing here reads it, and including
     // it rebuilt every renderer on each highlight change, re-rendering the whole
     // markdown tree (the entire document, in single-page mode).
+
+    // `collapsedSections` is read by every foldable block through the walk, so
+    // folding a heading has to rebuild this map — otherwise the chevron turns
+    // and nothing moves.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [highlightQuery, workspaceId, workspaceRevision, workspaceFiles, workspaceName, onOpenArtifact],
+    [
+      highlightQuery,
+      workspaceId,
+      workspaceRevision,
+      workspaceFiles,
+      workspaceName,
+      onOpenArtifact,
+      collapsedSections,
+    ],
   );
 
   return (
@@ -1366,6 +1504,7 @@ function MarkdownViewerImpl({
                 onSave={saveDraft}
                 onDone={leaveEditMode}
                 onCancel={cancelEdit}
+                onDirtyChange={setEditorDirty}
                 inspectMissed={inspectMissed}
               />
             ) : (
@@ -1375,13 +1514,15 @@ function MarkdownViewerImpl({
                 onClick={onContentClick}
               >
                 <SavedContext.Provider value={savedCtx}>
-                  <ReactMarkdown
-                    remarkPlugins={remarkPlugins}
-                    rehypePlugins={rehypePlugins}
-                    components={components}
-                  >
-                    {markdownSource}
-                  </ReactMarkdown>
+                  <CollapseContext.Provider value={collapseCtx}>
+                    <ReactMarkdown
+                      remarkPlugins={remarkPlugins}
+                      rehypePlugins={rehypePlugins}
+                      components={components}
+                    >
+                      {markdownSource}
+                    </ReactMarkdown>
+                  </CollapseContext.Provider>
                 </SavedContext.Provider>
               </div>
             )}
@@ -1548,6 +1689,7 @@ function SavableBlock({
 function HeadingLink({ as: Tag, children, id, highlight, ...rest }: any) {
   const [copied, setCopied] = useState(false);
   const ctx = useContext(SavedContext);
+  const collapse = useContext(CollapseContext);
   const text = Array.isArray(children)
     ? children.map((c) => (typeof c === "string" ? c : "")).join("")
     : String(children ?? "");
@@ -1555,8 +1697,26 @@ function HeadingLink({ as: Tag, children, id, highlight, ...rest }: any) {
   const savedSection = ctx?.enabled
     ? ctx.isSaved({ kind: "section", headingId: finalId })
     : undefined;
+  const collapsed = collapse?.isCollapsed(finalId) ?? false;
   return (
     <Tag id={finalId} {...rest} className="group scroll-mt-24">
+      {/* Wrap/unwrap everything under this heading. A chevron rather than a
+          twisty on the margin: the heading itself is the control, so the hit
+          target is where the reader is already looking. */}
+      {collapse && (
+        <button
+          onClick={() => collapse.toggle(finalId)}
+          className="mr-1.5 inline-flex h-7 w-7 items-center justify-center align-middle rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          aria-expanded={!collapsed}
+          aria-controls={`${finalId}-section`}
+          title={collapsed ? "Expand section" : "Collapse section"}
+          aria-label={collapsed ? "Expand section" : "Collapse section"}
+        >
+          <ChevronDown
+            className={`h-4 w-4 transition-transform ${collapsed ? "-rotate-90" : ""}`}
+          />
+        </button>
+      )}
       {typeof children === "string" ? (highlight?.(children) ?? children) : children}
       {/* A saved section still marks its heading, but only once it *is* saved:
           an always-present star on every heading was chrome the reader had to

@@ -30,6 +30,7 @@ import { Switch } from "@/components/ui/switch";
 import type { Highlight } from "@/lib/dom-highlighter";
 import type { MdFile } from "@/lib/markdown-utils";
 import type { ThemePref, ReadingMode, ReadingFont } from "@/lib/persistence";
+import { BIN_RETENTION_MS } from "@/lib/persistence";
 import { savedTypeLabel, type SavedEntry, type SavedItem } from "@/lib/saved-items";
 import { STORAGE_QUOTA_FRACTION, formatBytes } from "@/lib/storage-limits";
 
@@ -61,7 +62,12 @@ export interface SettingsPageProps {
   onSetDiagramColors: (on: boolean) => void;
   aiEnabled: boolean;
   onSetAiEnabled: (on: boolean) => void;
-  onToggleArchiveFile: (id: string) => void;
+  /** Bring a binned document back into the workspace. */
+  onRestoreFromBin: (id: string) => void;
+  /** Delete one binned document for good. */
+  onDeleteForever: (id: string) => void;
+  /** Empty the Bin entirely. */
+  onEmptyBin: () => void;
   /** Workspace file actions, moved here out of the workspace menus. */
   onImportWorkspace: (file: File) => void;
   onExportWorkspace: () => void;
@@ -116,7 +122,9 @@ export function SettingsPage({
   onSetDiagramColors,
   aiEnabled,
   onSetAiEnabled,
-  onToggleArchiveFile,
+  onRestoreFromBin,
+  onDeleteForever,
+  onEmptyBin,
   onImportWorkspace,
   onExportWorkspace,
   onShareWorkspace,
@@ -279,10 +287,21 @@ export function SettingsPage({
                   onClearAll={onClearHighlights}
                   onNavigate={onNavigate}
                 />
-                <ArchiveSettings files={files} onUnarchive={onToggleArchiveFile} />
+                <BinSettings
+                  files={files}
+                  onRestore={onRestoreFromBin}
+                  onDeleteForever={onDeleteForever}
+                  onEmptyBin={onEmptyBin}
+                />
               </div>
             )}
-            {activeTab === "storage" && <StorageSettings onClearStorage={onClearStorage} />}
+            {activeTab === "storage" && (
+              <StorageSettings
+                onClearStorage={onClearStorage}
+                binCount={files.filter((f) => typeof f.deletedAt === "number").length}
+                onEmptyBin={onEmptyBin}
+              />
+            )}
           </div>
         </div>
       </div>
@@ -901,7 +920,19 @@ function ClearAll({ onClick, confirm }: { onClick: () => void; confirm: string }
   );
 }
 
-function StorageSettings({ onClearStorage }: { onClearStorage: () => void }) {
+/** Fraction of the cap at which the Bin is worth pointing at. */
+const STORAGE_PRESSURE = 0.8;
+
+function StorageSettings({
+  onClearStorage,
+  binCount,
+  onEmptyBin,
+}: {
+  onClearStorage: () => void;
+  /** How many documents the Bin is holding, for the pressure prompt. */
+  binCount: number;
+  onEmptyBin: () => void;
+}) {
   const [usage, setUsage] = useState<number | null>(null);
   const [quota, setQuota] = useState<number | null>(null);
 
@@ -916,6 +947,10 @@ function StorageSettings({ onClearStorage }: { onClearStorage: () => void }) {
 
   const cap = quota != null ? Math.floor(quota * STORAGE_QUOTA_FRACTION) : null;
   const pct = usage != null && cap ? Math.min(100, (usage / cap) * 100) : null;
+  // Warned before writes start failing, not after: at this point there is still
+  // room to act, and the Bin is the one place holding files nobody asked to
+  // keep.
+  const underPressure = pct !== null && pct >= STORAGE_PRESSURE * 100 && binCount > 0;
 
   return (
     <div className="space-y-10">
@@ -933,12 +968,36 @@ function StorageSettings({ onClearStorage }: { onClearStorage: () => void }) {
             {pct !== null && (
               <div className="mt-2.5 h-1 overflow-hidden rounded-full bg-muted">
                 <div
-                  className="h-full rounded-full bg-primary transition-[width] duration-500"
+                  className={`h-full rounded-full transition-[width] duration-500 ${
+                    underPressure ? "bg-amber-500" : "bg-primary"
+                  }`}
                   style={{ width: `${Math.max(pct, 1)}%` }}
                 />
               </div>
             )}
           </div>
+          {underPressure && (
+            <Row
+              label="Storage is nearly full"
+              hint={`The Bin is holding ${binCount} file${binCount === 1 ? "" : "s"}. Emptying it frees that space now.`}
+              control={
+                <button
+                  onClick={() => {
+                    if (
+                      window.confirm(
+                        `Permanently delete ${binCount} file${binCount === 1 ? "" : "s"} in the Bin?`,
+                      )
+                    ) {
+                      onEmptyBin();
+                    }
+                  }}
+                  className="rounded-md px-2.5 py-1 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10"
+                >
+                  Empty Bin
+                </button>
+              }
+            />
+          )}
         </Group>
       </Section>
 
@@ -1088,38 +1147,80 @@ function HighlightSettings({
   );
 }
 
-function ArchiveSettings({
+/**
+ * The Bin: everything the reader has removed, and how long it has left.
+ *
+ * This replaced a separate Archive panel and an irreversible Delete. A binned
+ * document is recoverable for thirty days and says so per row, so "remove" no
+ * longer means two different things depending on which menu item was used.
+ */
+function BinSettings({
   files,
-  onUnarchive,
+  onRestore,
+  onDeleteForever,
+  onEmptyBin,
 }: {
   files: MdFile[];
-  onUnarchive: (id: string) => void;
+  onRestore: (id: string) => void;
+  onDeleteForever: (id: string) => void;
+  onEmptyBin: () => void;
 }) {
-  const archivedFiles = files.filter((f) => f.isArchived);
+  const binned = files
+    .filter((f) => typeof f.deletedAt === "number")
+    .sort((a, b) => (b.deletedAt ?? 0) - (a.deletedAt ?? 0));
+
+  const daysLeft = (deletedAt: number) =>
+    Math.max(0, Math.ceil((deletedAt + BIN_RETENTION_MS - Date.now()) / (24 * 60 * 60 * 1000)));
 
   return (
     <Section
-      title="Archived"
-      description="Archived files are hidden from the sidebar but stay available as embedded resources."
+      title="Bin"
+      description="Removed files stay here for 30 days, then delete themselves. Restore one at any time before that."
+      action={
+        binned.length > 0 && (
+          <ClearAll
+            onClick={onEmptyBin}
+            confirm={`Permanently delete ${binned.length} file${binned.length === 1 ? "" : "s"} in the Bin?`}
+          />
+        )
+      }
     >
       <Group>
-        {archivedFiles.length === 0 ? (
-          <Empty>No archived files.</Empty>
+        {binned.length === 0 ? (
+          <Empty>The Bin is empty.</Empty>
         ) : (
-          archivedFiles.map((file) => (
-            <Row
-              key={file.id}
-              label={file.name}
-              control={
-                <button
-                  onClick={() => onUnarchive(file.id)}
-                  className="rounded-md px-2.5 py-1 text-xs font-medium text-primary transition-colors hover:bg-primary/10"
-                >
-                  Unarchive
-                </button>
-              }
-            />
-          ))
+          binned.map((file) => {
+            const left = daysLeft(file.deletedAt as number);
+            return (
+              <Row
+                key={file.id}
+                label={file.name}
+                hint={
+                  left === 0 ? "Deletes on next open" : `${left} day${left === 1 ? "" : "s"} left`
+                }
+                control={
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => onRestore(file.id)}
+                      className="rounded-md px-2.5 py-1 text-xs font-medium text-primary transition-colors hover:bg-primary/10"
+                    >
+                      Restore
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (window.confirm(`Permanently delete "${file.name}"?`)) {
+                          onDeleteForever(file.id);
+                        }
+                      }}
+                      className="rounded-md px-2.5 py-1 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                }
+              />
+            );
+          })
         )}
       </Group>
     </Section>
