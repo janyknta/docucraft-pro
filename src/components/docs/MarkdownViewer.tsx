@@ -38,6 +38,8 @@ import {
   Search,
   Crosshair,
   Download,
+  Expand,
+  Minimize2,
 } from "lucide-react";
 import type { MdFile } from "@/lib/markdown-utils";
 import type { ReadingMode } from "@/lib/persistence";
@@ -45,6 +47,7 @@ import { slugify } from "@/lib/markdown-utils";
 import { MermaidBlock } from "./MermaidLazy";
 import { SaveActionContext } from "./save-action";
 import { MindMapBlock } from "./MindMapBlock";
+import { JsonTree } from "./JsonTree";
 import { ReadingProgress } from "./ReadingProgress";
 import { MarkdownEditor, type MarkdownEditorHandle } from "./MarkdownEditor";
 import { detectEmbed, EmbedFrame, isVideoUrl, VideoPlayer } from "@/lib/media-embeds";
@@ -1626,6 +1629,21 @@ function CodeBlock({ children, ...rest }: any) {
     );
   }
 
+  // A ```json fence renders as a browsable tree rather than a wall of text.
+  // Malformed JSON falls through to the plain code block below, so a typo
+  // still shows the author what they wrote instead of an error.
+  if (lang === "json") {
+    const raw = extractText(codeEl?.props?.children);
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed !== null && typeof parsed === "object") {
+        return <JsonFigure value={parsed} />;
+      }
+    } catch {
+      // Not valid JSON — fall through.
+    }
+  }
+
   return (
     <div className="group relative my-6">
       {/* {lang && (
@@ -1651,6 +1669,56 @@ function CodeBlock({ children, ...rest }: any) {
       <pre ref={ref} {...rest}>
         {children}
       </pre>
+    </div>
+  );
+}
+
+/**
+ * A ```json fence, rendered as a browsable tree with a full-screen control.
+ *
+ * Structured data in a document has the same problem a diagram does: it gets
+ * the width of a text column, which is the one place a deep tree is least
+ * readable. Full screen is the element's own rather than an overlay, so the
+ * branches the reader has opened survive going in and coming back out, and
+ * Escape or the browser's own exit are followed like any other fullscreen.
+ */
+function JsonFigure({ value }: { value: unknown }) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const [full, setFull] = useState(false);
+
+  useEffect(() => {
+    const sync = () => setFull(document.fullscreenElement === hostRef.current);
+    document.addEventListener("fullscreenchange", sync);
+    return () => document.removeEventListener("fullscreenchange", sync);
+  }, []);
+
+  const toggle = () => {
+    const el = hostRef.current;
+    if (!el) return;
+    if (document.fullscreenElement === el) void document.exitFullscreen();
+    else void el.requestFullscreen?.().catch(() => setFull(false));
+  };
+
+  return (
+    <div
+      ref={hostRef}
+      className={`overflow-hidden border-border bg-background ${
+        full ? "flex h-screen w-screen flex-col rounded-none border-0" : "my-6 rounded-xl border"
+      }`}
+    >
+      <div className="flex items-center justify-end border-b border-border/70 bg-background/40 px-2 py-1.5">
+        <button
+          onClick={toggle}
+          title={full ? "Exit full screen" : "Full screen"}
+          aria-label={full ? "Exit full screen" : "Full screen"}
+          className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+        >
+          {full ? <Minimize2 className="h-3.5 w-3.5" /> : <Expand className="h-3.5 w-3.5" />}
+        </button>
+      </div>
+      <div className={full ? "min-h-0 flex-1 overflow-auto" : "max-h-128 overflow-auto"}>
+        <JsonTree value={value} />
+      </div>
     </div>
   );
 }

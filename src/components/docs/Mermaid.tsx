@@ -1,6 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createPortal } from "react-dom";
-import { Download, Expand, LoaderCircle, Minus, Plus, Star, X } from "lucide-react";
+import { Download, Expand, LoaderCircle, Minimize2, Minus, Plus, Star } from "lucide-react";
 import { toast } from "sonner";
 import type { MermaidAnimator as MermaidAnimatorInstance } from "mermaid-animator";
 import { useSaveAction } from "./save-action";
@@ -270,17 +269,27 @@ export function Mermaid({
   // no indication why.
   useEffect(() => setRawZoom(1), [source, mode]);
 
+  // Full screen is the frame's own, through the Fullscreen API, rather than an
+  // overlay painted over the page. An overlay is only ever as large as the
+  // viewport the browser chrome leaves behind, and a diagram is exactly the
+  // thing worth handing the whole display.
+  //
+  // The state follows the document rather than the button: Escape and the
+  // browser's own exit both leave full screen without going through the
+  // control, and the flag has to agree either way.
+  const frameRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (!fullscreen) return;
-    const previous = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    const onKey = (event: KeyboardEvent) => event.key === "Escape" && setFullscreen(false);
-    window.addEventListener("keydown", onKey);
-    return () => {
-      document.body.style.overflow = previous;
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [fullscreen]);
+    const sync = () => setFullscreen(document.fullscreenElement === frameRef.current);
+    document.addEventListener("fullscreenchange", sync);
+    return () => document.removeEventListener("fullscreenchange", sync);
+  }, []);
+
+  const toggleFullscreen = useCallback(() => {
+    const el = frameRef.current;
+    if (!el) return;
+    if (document.fullscreenElement === el) void document.exitFullscreen();
+    else void el.requestFullscreen?.().catch(() => setFullscreen(false));
+  }, []);
 
   // One download, one format. The animation *is* the artifact, and WebM is the
   // only export that carries it; GIF and a still SVG were each a lossy answer to
@@ -401,8 +410,11 @@ export function Mermaid({
             these. The animated stages carry their own pair down on the
             artwork. */}
         {effectiveMode === "raw" ? rawZoomControls : null}
-        <TrayButton onClick={() => setFullscreen(true)} label="Fullscreen">
-          <Expand className="h-3.5 w-3.5" />
+        <TrayButton
+          onClick={toggleFullscreen}
+          label={fullscreen ? "Exit full screen" : "Fullscreen"}
+        >
+          {fullscreen ? <Minimize2 className="h-3.5 w-3.5" /> : <Expand className="h-3.5 w-3.5" />}
         </TrayButton>
       </Tray>
     </div>
@@ -465,77 +477,40 @@ export function Mermaid({
           is the stage's, mirrored here, because `w-fit` would instead collapse a
           wide diagram to its intrinsic width and shrink the picture. */}
       <div
-        className="mermaid-frame my-6 overflow-hidden rounded-xl border border-border bg-muted/30 mx-auto"
-        style={frameCap ? { maxWidth: frameCap } : undefined}
+        ref={frameRef}
+        className={`mermaid-frame overflow-hidden border-border bg-muted/30 ${
+          fullscreen
+            ? "flex h-screen w-screen flex-col rounded-none border-0"
+            : "my-6 rounded-xl border mx-auto"
+        }`}
+        style={fullscreen ? undefined : frameCap ? { maxWidth: frameCap } : undefined}
         data-performance-mode={performanceMode ? "" : undefined}
       >
         {header}
-        {/* While fullscreen is open the inline stage is torn down rather than
-            left mounted behind the overlay. Both copies are live SVG, so
-            keeping this one costs a second full style and layout pass over a
-            diagram nobody can currently see — on a large ERD that is the
-            difference between a smooth overlay and a locked tab. The frame
-            keeps its measured height, so closing fullscreen does not make the
-            surrounding text jump. */}
+        {/* One stage, which simply grows into the screen when the frame does.
+            There used to be a second copy inside an overlay, and the inline one
+            was torn down while it was open to avoid paying for two live SVGs at
+            once; with the frame itself going full screen there is only ever one
+            diagram mounted, so nothing has to be swapped out or measured to
+            stop the surrounding text from jumping. */}
         {renderError ? (
           <MermaidError error={renderError} />
         ) : fullscreen ? (
-          <div style={frameCap ? { aspectRatio: `1 / ${stageRatio ?? 0.42}` } : undefined} />
+          <div className="min-h-0 flex-1">
+            {performanceMode ? (
+              performanceImageUrl ? (
+                <PerformanceDiagramImage src={performanceImageUrl} name={baseName(name)} fill />
+              ) : (
+                <StageSpinner label="Preparing large diagram…" />
+              )
+            ) : (
+              stageFor(true)
+            )}
+          </div>
         ) : (
           stageFor(false)
         )}
       </div>
-
-      {fullscreen &&
-        createPortal(
-          <div className="fixed inset-0 z-(--z-overlay) flex items-center justify-center p-0 sm:p-4">
-            <div
-              className="absolute inset-0 bg-foreground/30 backdrop-blur-sm"
-              onClick={() => setFullscreen(false)}
-              aria-hidden
-            />
-            <div
-              role="dialog"
-              aria-modal="true"
-              aria-label="Animated Mermaid diagram"
-              className="relative flex h-full w-full flex-col overflow-hidden border-border bg-card shadow-2xl sm:h-[92vh] sm:max-w-[min(1600px,95vw)] sm:rounded-2xl sm:border"
-            >
-              <header className="flex h-14 shrink-0 items-center justify-between gap-3 border-b border-border px-4 sm:px-6">
-                <div>
-                  <h1 className="text-sm font-semibold text-foreground">{baseName(name)}</h1>
-                  <p className="text-[11px] text-muted-foreground">
-                    {performanceMode ? "Large-diagram performance mode" : MODE_HINT[mode]}
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  {modeControl}
-                  <Tray>
-                    {saveControl}
-                    {effectiveMode === "flow" ? downloadControl : null}
-                    {effectiveMode === "raw" ? rawZoomControls : null}
-                  </Tray>
-                  <Tray key="close">
-                    <TrayButton onClick={() => setFullscreen(false)} label="Close diagram">
-                      <X className="h-4 w-4" />
-                    </TrayButton>
-                  </Tray>
-                </div>
-              </header>
-              <div className="min-h-0 flex-1">
-                {performanceMode ? (
-                  performanceImageUrl ? (
-                    <PerformanceDiagramImage src={performanceImageUrl} name={baseName(name)} fill />
-                  ) : (
-                    <StageSpinner label="Preparing large diagram…" />
-                  )
-                ) : (
-                  stageFor(true)
-                )}
-              </div>
-            </div>
-          </div>,
-          document.body,
-        )}
     </>
   );
 }
