@@ -82,7 +82,6 @@ import { clearArtifactResolutionCache } from "@/lib/workspace-artifacts";
 import { loadReadingFont, warmAppFonts } from "@/lib/fonts";
 import { restoreCustomFont } from "@/lib/custom-font";
 import { loadGoogleFont } from "@/lib/google-font";
-import { warmMarkdownPlugins } from "@/lib/markdown-plugins";
 import { toast } from "sonner";
 import { useHistory } from "@/hooks/use-history";
 import {
@@ -104,6 +103,7 @@ import {
   type PersistedFile,
   type FolderRecord,
   type WorkspaceRecord,
+  type WorkspaceSummary,
   type SaveStatus,
   type ThemePref,
   type ReadingMode,
@@ -173,6 +173,7 @@ function toMdFile(f: PersistedFile): MdFile {
     addedAt: f.addedAt,
     kind: f.kind ?? getDocumentKind(f.name, f.mimeType),
     folderId: f.folderId ?? null,
+    deletedAt: f.deletedAt,
   };
 }
 
@@ -488,13 +489,8 @@ export function DocsApp() {
   const scrollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const restoredFlash = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Collapse/expand the desktop sidebar; the main column is flex-1, so animating
-  // the sidebar width lets content reflow frame-by-frame rather than snapping.
-  // Width is driven imperatively so a re-render can't clobber the tween.
-  //
-  // This and one fade in the markdown viewer were the app's only uses of GSAP —
-  // 153 kB in the initial download for two keyframe pairs. They run on the Web
-  // Animations API now, which the browser can hand to the compositor.
+  // Resize the reading column once. Animating sidebar width reflows every
+  // paragraph, table and diagram on every frame; only the sidebar contents fade.
   useEffect(() => {
     const wrap = sidebarWrapRef.current;
     if (!wrap) return;
@@ -517,20 +513,6 @@ export function DocsApp() {
     }
 
     const animations: Animation[] = [];
-    // Width isn't compositable, but this element is a fixed-width flex sibling
-    // of the content column — the reflow it drives is the point of the effect.
-    if (wrap.animate) {
-      animations.push(
-        wrap.animate(
-          [{ width: wrap.getBoundingClientRect().width + "px" }, { width: `${width}px` }],
-          {
-            duration: 450,
-            easing: "cubic-bezier(0.65, 0, 0.35, 1)",
-            fill: "forwards",
-          },
-        ),
-      );
-    }
     wrap.style.width = `${width}px`;
 
     if (inner) {
@@ -546,7 +528,7 @@ export function DocsApp() {
           { opacity: String(opacity), transform: `translateX(${shift}px)` },
         ],
         {
-          duration: sidebarCollapsed ? 250 : 400,
+          duration: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 160,
           easing: "cubic-bezier(0.16, 1, 0.3, 1)",
           fill: "forwards",
         },
@@ -642,25 +624,14 @@ export function DocsApp() {
     };
   }, [googleFont]);
 
-  // Inter backs the app chrome, and syntax highlighting / math typesetting back
-  // most documents. All three are requested off the critical path: the first
-  // paint runs on system fonts and unhighlighted code, and each upgrade lands
-  // without the reader having waited on it.
-  //
-  // Held until after first contentful paint. `requestIdleCallback` alone was not
-  // late enough: the browser considers itself idle while it is still waiting on
-  // the boot chunks, so the warm wave (rehype-katex ~65 kB, rehype-highlight
-  // ~40 kB, the palette chunk and four Inter faces) opened its connections at
-  // ~378 ms and landed on top of FCP instead of after it — first-paint measured
-  // 156 ms but FCP 396 ms. Waiting for the paint entry moves that whole wave
-  // behind the reader's first frame, which is the only thing it was ever
-  // supposed to be behind.
+  // Warm the UI font after first contentful paint. Markdown plugins stay
+  // demand-loaded; idle importing them still adds download and execution work
+  // to every session, even when the reader never opens code or equations.
   useEffect(() => {
     let idle = 0;
     const start = () => {
       idle = requestIdleCallbackSafe(() => {
         warmAppFonts();
-        warmMarkdownPlugins();
       });
     };
 
@@ -732,6 +703,7 @@ export function DocsApp() {
         addedAt: f.addedAt,
         kind: f.kind,
         folderId: f.folderId ?? null,
+        deletedAt: f.deletedAt,
       })),
       folders: s.folders,
       // `bookmarks` is the legacy projection of `saved`, still written so an
@@ -761,20 +733,30 @@ export function DocsApp() {
 
   const persistNow = useCallback(
     async (silent: boolean) => {
-      if (!workspaceIdRef.current) return;
+      if (!workspaceIdRef.current) return true;
       if (mutationRef.current === savedMutationRef.current) {
         // Nothing changed since the last write. Still settle the indicator, so
         // a "Saving…" left over from a coalesced burst doesn't stick.
         if (!silent) setSaveStatus("saved");
-        return;
+        return true;
       }
       const pending = mutationRef.current;
+      const targetId = workspaceIdRef.current;
       try {
         await persistence.putWorkspace(buildRecord());
-        savedMutationRef.current = pending;
-        if (!silent) setSaveStatus("saved");
-      } catch {
+        if (workspaceIdRef.current === targetId) {
+          savedMutationRef.current = Math.max(savedMutationRef.current, pending);
+          if (!silent && pending === mutationRef.current) setSaveStatus("saved");
+        }
+        return true;
+      } catch (error) {
         if (!silent) setSaveStatus("idle");
+        console.error("Could not save workspace", error);
+        toast.error(
+          "Changes could not be saved. Keep this tab open and export your workspace as a backup.",
+          { id: "workspace-save-error" },
+        );
+        return false;
       }
     },
     [buildRecord],
@@ -794,6 +776,7 @@ export function DocsApp() {
 
   const hydrateWorkspace = useCallback(
     (ws: WorkspaceRecord) => {
+      if (saveTimer.current) clearTimeout(saveTimer.current);
       const wsFolders = ws.folders ?? [];
       const folderIds = new Set(wsFolders.map((f) => f.id));
       // A file can outlive its folder (an older export, a share link that carried
@@ -805,14 +788,9 @@ export function DocsApp() {
       });
 
       if (ws.ui?.fileOrder && ws.ui.fileOrder.length > 0) {
-        const order = ws.ui.fileOrder;
+        const order = new Map(ws.ui.fileOrder.map((id, index) => [id, index]));
         parsed.sort((a, b) => {
-          const idxA = order.indexOf(a.id);
-          const idxB = order.indexOf(b.id);
-          if (idxA === -1 && idxB === -1) return 0;
-          if (idxA === -1) return 1;
-          if (idxB === -1) return -1;
-          return idxA - idxB;
+          return (order.get(a.id) ?? Infinity) - (order.get(b.id) ?? Infinity);
         });
       }
 
@@ -866,9 +844,9 @@ export function DocsApp() {
   );
 
   const refreshWorkspaceList = useCallback(async () => {
-    const list = await persistence.listWorkspaces().catch(() => [] as WorkspaceRecord[]);
+    const list = await persistence.listWorkspaceSummaries();
     list.sort((a, b) => a.createdAt - b.createdAt);
-    setWorkspaces(list.map((w) => ({ id: w.id, name: w.name, docCount: w.files?.length || 0 })));
+    setWorkspaces(list);
   }, []);
 
   // Restore the previous session on first load.
@@ -889,7 +867,7 @@ export function DocsApp() {
             // This runs during boot, before anything is on screen, so a name
             // clash is settled by numbering rather than by a modal prompt the
             // reader would meet before the app has even drawn.
-            const already = await persistence.listWorkspaces().catch(() => [] as WorkspaceRecord[]);
+            const already = await persistence.listWorkspaceSummaries();
             ws.name = availableWorkspaceName(`${ws.name} (Shared)`, already);
             await persistence.putWorkspace(ws);
             hashSharedWs = ws;
@@ -905,7 +883,7 @@ export function DocsApp() {
           }
         }
 
-        const list = await persistence.listWorkspaces().catch(() => [] as WorkspaceRecord[]);
+        const list = await persistence.listWorkspaceSummaries();
         if (list.length === 0 && !hashSharedWs) {
           if (!alive) return;
           setWorkspaces([]);
@@ -913,15 +891,23 @@ export function DocsApp() {
           workspaceIdRef.current = null;
           setSaveStatus("idle");
         } else {
-          const ws = hashSharedWs || (list.find((w) => w.id === prefs.lastWorkspaceId) ?? list[0]);
+          const selected = list.find((w) => w.id === prefs.lastWorkspaceId) ?? list[0];
+          const ws = hashSharedWs ?? (await persistence.getWorkspace(selected.id));
           if (!alive) return;
+          if (!ws) throw new Error("The selected workspace could not be loaded");
           list.sort((a, b) => a.createdAt - b.createdAt);
-          setWorkspaces(
-            list.map((w) => ({ id: w.id, name: w.name, docCount: w.files?.length || 0 })),
-          );
+          setWorkspaces(list);
           hydrateWorkspace(ws);
           savePrefs({ lastWorkspaceId: ws.id });
         }
+      } catch (error) {
+        console.error("Could not restore local workspace", error);
+        if (alive)
+          toast.error(
+            error instanceof Error
+              ? error.message
+              : "Could not open local storage. Please reload to retry.",
+          );
       } finally {
         if (alive) {
           hydratedRef.current = true;
@@ -1745,7 +1731,7 @@ flowchart LR
   const switchWorkspace = useCallback(
     async (id: string) => {
       if (id === workspaceIdRef.current) return;
-      await persistNow(true);
+      if (!(await persistNow(true))) return;
       const ws = await persistence.getWorkspace(id);
       if (!ws) return;
       hydrateWorkspace(ws);
@@ -1771,10 +1757,7 @@ flowchart LR
 
   // The workspace list held in state is a render-time convenience; name checks
   // read the store directly so a workspace created in another tab still counts.
-  const storedWorkspaces = useCallback(
-    () => persistence.listWorkspaces().catch(() => [] as WorkspaceRecord[]),
-    [],
-  );
+  const storedWorkspaces = useCallback(() => persistence.listWorkspaceSummaries(), []);
 
   const newWorkspace = useCallback(
     async (name?: string) => {
@@ -1782,7 +1765,7 @@ flowchart LR
       if (!asked) return;
       const finalName = resolveWorkspaceName(asked, await storedWorkspaces());
       if (!finalName) return;
-      await persistNow(true);
+      if (!(await persistNow(true))) return;
       const ws = newWorkspaceRecord(finalName);
       await persistence.putWorkspace(ws);
       await refreshWorkspaceList();
@@ -1822,7 +1805,7 @@ flowchart LR
         if (!finalName) return; // reader cancelled the rename — import nothing
         ws.name = finalName;
 
-        await persistNow(true);
+        if (!(await persistNow(true))) return;
         await persistence.putWorkspace(ws);
         await refreshWorkspaceList();
         hydrateWorkspace(ws);
@@ -1961,7 +1944,7 @@ flowchart LR
         }
 
         if (target === "new") {
-          await persistNow(true);
+          if (!(await persistNow(true))) return;
           const ws = newWorkspaceRecord(newName.trim() || payload.sourceName);
           ws.files = stamped;
           ws.ui.activeFileId = stamped[0].id;
@@ -2033,16 +2016,26 @@ flowchart LR
   const deleteWorkspace = useCallback(
     async (id: string) => {
       await persistence.deleteWorkspace(id);
-      let list = await persistence.listWorkspaces().catch(() => [] as WorkspaceRecord[]);
+      let list: WorkspaceSummary[] = await persistence.listWorkspaceSummaries();
       if (list.length === 0) {
         const ws = newWorkspaceRecord("My workspace");
         await persistence.putWorkspace(ws);
-        list = [ws];
+        list = [
+          {
+            id: ws.id,
+            name: ws.name,
+            createdAt: ws.createdAt,
+            updatedAt: ws.updatedAt,
+            docCount: 0,
+          },
+        ];
       }
       list.sort((a, b) => a.createdAt - b.createdAt);
-      setWorkspaces(list.map((w) => ({ id: w.id, name: w.name, docCount: w.files?.length || 0 })));
+      setWorkspaces(list);
       if (id === workspaceIdRef.current) {
-        hydrateWorkspace(list[0]);
+        const next = await persistence.getWorkspace(list[0].id);
+        if (!next) throw new Error("Workspace could not be loaded");
+        hydrateWorkspace(next);
         savePrefs({ lastWorkspaceId: list[0].id });
       }
     },
@@ -2930,6 +2923,10 @@ flowchart LR
                 <ResizablePanelGroup orientation="horizontal" className="h-full">
                   {paneLayout.panes.map((pane, index) => {
                     const paneFile = files.find((f) => f.id === pane.activeTabId) ?? null;
+                    const paneKind = paneFile
+                      ? (paneFile.kind ?? getDocumentKind(paneFile.name, paneFile.mimeType))
+                      : null;
+                    const paneIsBoard = paneKind === "board";
                     return (
                       <Fragment key={pane.id}>
                         {index > 0 && <ResizableHandle withHandle />}
@@ -2939,7 +2936,7 @@ flowchart LR
                         >
                           <div
                             onMouseDown={() => focusPane(pane.id)}
-                            className="flex h-full min-h-0 flex-col"
+                            className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden"
                           >
                             {/* No tab strip. The open documents live in the
                                 sidebar; a pane is just a column of reading, and
@@ -2965,7 +2962,13 @@ flowchart LR
                                 <X className="h-3.5 w-3.5" />
                               </button>
                             </div>
-                            <div className="min-h-0 flex-1 overflow-y-auto px-4">
+                            <div
+                              className={
+                                paneIsBoard
+                                  ? "min-h-0 min-w-0 flex-1 overflow-hidden"
+                                  : "min-h-0 min-w-0 flex-1 overflow-y-auto px-4"
+                              }
+                            >
                               {paneFile ? (
                                 <PaneDocument
                                   file={paneFile}
@@ -2984,6 +2987,8 @@ flowchart LR
                                   onRemoveSaved={removeSaved}
                                   onOpenArtifact={openEmbeddedArtifact}
                                   readingMode={readingMode}
+                                  startInEditFileId={autoEditFileId}
+                                  onStartInEditConsumed={consumeStartInEdit}
                                 />
                               ) : (
                                 <p className="px-2 py-16 text-center text-sm text-muted-foreground">

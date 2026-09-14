@@ -1,5 +1,6 @@
-import { useCallback, useMemo } from "react";
+import { lazy, useCallback, useMemo } from "react";
 import { MarkdownViewer } from "./MarkdownViewer";
+import { getDocumentKind } from "@/lib/document-utils";
 import type { Highlight } from "@/lib/dom-highlighter";
 import type { MdFile } from "@/lib/markdown-utils";
 import type { ReadingMode } from "@/lib/persistence";
@@ -7,6 +8,13 @@ import type { SavedDraft, SavedItem } from "@/lib/saved-items";
 
 const EMPTY_HIGHLIGHTS: Highlight[] = [];
 const EMPTY_SAVED: SavedItem[] = [];
+
+// Keep non-markdown readers out of the initial reading bundle, just as the
+// single-document path does in DocsApp. The Suspense boundary around the main
+// content column also covers panes that load this viewer.
+const DocumentViewer = lazy(() =>
+  import("./DocumentViewer").then((module) => ({ default: module.DocumentViewer })),
+);
 
 /**
  * One pane's document.
@@ -38,6 +46,8 @@ export function PaneDocument({
   onRemoveSaved,
   onOpenArtifact,
   readingMode,
+  startInEditFileId,
+  onStartInEditConsumed,
 }: {
   file: MdFile;
   files: MdFile[];
@@ -55,6 +65,8 @@ export function PaneDocument({
   onRemoveSaved: (id: string) => void;
   onOpenArtifact?: (fileId: string, workspaceId: string) => void;
   readingMode: ReadingMode;
+  startInEditFileId?: string | null;
+  onStartInEditConsumed?: () => void;
 }) {
   const fileHighlights = useMemo(() => {
     const mine = highlights.filter((hl) => hl.fileId === file.id);
@@ -75,6 +87,29 @@ export function PaneDocument({
     [onToggleSaved, file.id],
   );
 
+  // A split is a layout concern, not a document-type mode. Resolve the viewer
+  // for this pane alone so markdown, boards, PDFs, spreadsheets, and every
+  // other supported kind can sit beside one another.
+  const kind = file.kind ?? getDocumentKind(file.name, file.mimeType);
+
+  if (kind !== "markdown" && kind !== "text") {
+    return (
+      <DocumentViewer
+        key={file.id}
+        file={file}
+        isBookmarked={fileSaved.some((item) => item.kind === "file")}
+        onToggleBookmark={() => onToggleSaved(file.id, { kind: "file", title: file.name })}
+        prevFile={null}
+        nextFile={null}
+        onNavFile={() => {}}
+        onContentChange={onContentChange}
+        fillAvailableHeight
+        startInEditFileId={startInEditFileId}
+        onStartInEditConsumed={onStartInEditConsumed}
+      />
+    );
+  }
+
   return (
     <MarkdownViewer
       // Keyed by document for the same reason the editor is: a pane switching
@@ -89,6 +124,8 @@ export function PaneDocument({
       activeSubtopicId={null}
       highlightQuery={null}
       onContentChange={onContentChange}
+      startInEditFileId={startInEditFileId}
+      onStartInEditConsumed={onStartInEditConsumed}
       nextReadingMin={null}
       isBookmarked={fileSaved.some((item) => item.kind === "file")}
       onToggleBookmark={() => onToggleSaved(file.id, { kind: "file", title: file.name })}

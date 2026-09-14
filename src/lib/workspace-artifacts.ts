@@ -89,31 +89,40 @@ export function resolveWorkspaceArtifact(
   }
   const cacheKey = `${currentWorkspaceId ?? ""}:${revision ?? ""}:${clean}`.toLocaleLowerCase();
   if (resolutionCache.has(cacheKey)) return resolutionCache.get(cacheKey)!;
-  const result = persistence.listWorkspaces().then((workspaces) => {
-    const [workspacePart, ...fileParts] = clean.split("/");
-    const hasWorkspace = fileParts.length > 0;
-    const fileName = hasWorkspace ? fileParts.join("/") : clean;
-    const candidates = hasWorkspace
-      ? workspaces.filter(
-          (workspace) => workspace.name.toLocaleLowerCase() === workspacePart.toLocaleLowerCase(),
-        )
-      : [
-          ...workspaces.filter((workspace) => workspace.id === currentWorkspaceId),
-          ...workspaces.filter((workspace) => workspace.id !== currentWorkspaceId),
-        ];
-    for (const workspace of candidates) {
-      const file = workspace.files.find(
-        (item) => item.name.toLocaleLowerCase() === fileName.toLocaleLowerCase(),
-      );
-      if (file)
-        return {
-          file: hydrateFile(file),
-          workspaceId: workspace.id,
-          workspaceName: workspace.name,
-        };
-    }
-    return null;
-  });
+  const result = persistence
+    .listWorkspaceSummaries()
+    .then(async (workspaces) => {
+      const [workspacePart, ...fileParts] = clean.split("/");
+      const hasWorkspace = fileParts.length > 0;
+      const fileName = hasWorkspace ? fileParts.join("/") : clean;
+      const candidates = hasWorkspace
+        ? workspaces.filter(
+            (workspace) => workspace.name.toLocaleLowerCase() === workspacePart.toLocaleLowerCase(),
+          )
+        : [
+            ...workspaces.filter((workspace) => workspace.id === currentWorkspaceId),
+            ...workspaces.filter((workspace) => workspace.id !== currentWorkspaceId),
+          ];
+      for (const summary of candidates) {
+        const workspace = await persistence.getWorkspace(summary.id);
+        if (!workspace) continue;
+        const file = workspace.files.find(
+          (item) => item.name.toLocaleLowerCase() === fileName.toLocaleLowerCase(),
+        );
+        if (file)
+          return {
+            file: hydrateFile(file),
+            workspaceId: workspace.id,
+            workspaceName: workspace.name,
+          };
+      }
+      return null;
+    })
+    .catch((error) => {
+      resolutionCache.delete(cacheKey);
+      throw error;
+    });
+  if (resolutionCache.size >= 100) resolutionCache.delete(resolutionCache.keys().next().value!);
   resolutionCache.set(cacheKey, result);
   return result;
 }
@@ -124,6 +133,7 @@ export function clearArtifactResolutionCache() {
 
 /** Turn the two ergonomic Markdown forms into a standard custom image URL. */
 export function prepareWorkspaceEmbeds(markdown: string) {
+  if (!markdown.includes("![[") && !markdown.includes("@[file]")) return markdown;
   let fenced = false;
   return markdown
     .split("\n")

@@ -340,6 +340,30 @@ export function locateInSource(
   }
 }
 
+/**
+ * The source code behind a rendered selection.
+ *
+ * A located span starts and ends on visible characters, which is right for
+ * placing the editor caret but would drop surrounding Markdown markers (and
+ * can leave JSON punctuation behind). Copying the complete source lines keeps
+ * the snippet valid and preserves the representation the author actually
+ * wrote. Returns `null` when the rendered text can no longer be located.
+ */
+export function sourceLinesForSelection(
+  source: string,
+  selection: string,
+  prefer?: { from: number; to: number },
+): string | null {
+  const span = locateInSource(source, selection, prefer);
+  if (!span) return null;
+
+  const start = source.lastIndexOf("\n", Math.max(0, span.start - 1)) + 1;
+  const nextLine = source.indexOf("\n", span.end);
+  const end = nextLine === -1 ? source.length : nextLine;
+  const snippet = source.slice(start, end);
+  return snippet.endsWith("\r") ? snippet.slice(0, -1) : snippet;
+}
+
 /** Whole-word occurrences of `word` in `hay`, capped — only rarity matters. */
 function countWord(hay: string, word: string, cap = 32): number {
   let count = 0;

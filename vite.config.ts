@@ -29,17 +29,14 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
-    // `mermaid` is deliberately NOT pre-bundled. It is loaded lazily (see
-    // MermaidLazy.tsx) and forcing it through optimizeDeps pulled its whole
-    // dependency tree — cytoscape, dagre, d3 — into the dev-server warm-up and
-    // encouraged it back into the initial graph.
-    exclude: ["mermaid", "@babel/standalone", "xlsx", "mammoth"],
-    // `cytoscape-cose-bilkent` (mermaid's mindmap layout) ships CommonJS only —
-    // no `module`, no `exports` — and because `mermaid` is excluded above, Vite
-    // never converts it, so importing a mindmap died with "does not provide an
-    // export named default". Pre-bundling just the CJS leaf fixes the import
-    // without dragging mermaid itself back into the warm-up.
+    // Pre-bundling is a dev-server optimization, independent of production
+    // code splitting. Excluding these libraries causes large module waterfalls
+    // and leaves CommonJS imports unconverted when a viewer is first opened.
     include: [
+      "mermaid",
+      "@babel/standalone",
+      "xlsx",
+      "mammoth/mammoth.browser",
       "dayjs",
       "@braintree/sanitize-url",
       "cytoscape",
