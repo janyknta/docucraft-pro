@@ -142,6 +142,8 @@ const VIEW_LABEL: Record<SidebarView["mode"], string> = {
 export interface SidebarFolder {
   id: string;
   name: string;
+  /** Folder this one sits inside; null/undefined = top level. */
+  parentId?: string | null;
 }
 
 /**
@@ -150,6 +152,12 @@ export interface SidebarFolder {
  * file dragged in from the desktop still reaches the uploader.
  */
 const FILE_DND = "application/x-localdox-file";
+/**
+ * Drag payload for re-parenting a folder. Its own type, so a folder row accepts
+ * a dragged folder and a dragged document as two different drops — and so the
+ * reorder drag, which carries no data at all, still matches neither.
+ */
+const FOLDER_DND = "application/x-localdox-folder";
 
 interface Props {
   files: MdFile[];
@@ -175,7 +183,10 @@ interface Props {
   /** Create an animated standalone Mermaid source file. */
   onCreateMermaid?: (folderId?: string | null) => void;
   onCreateBoard?: (folderId?: string | null) => void;
-  onCreateFolder?: (name: string) => void;
+  /** Create a folder, optionally nested inside an existing one. */
+  onCreateFolder?: (name: string, parentId?: string | null) => void;
+  /** Re-parent a folder. `null` puts it back at the top level. */
+  onMoveFolderToFolder?: (folderId: string, parentId: string | null) => void;
   onRenameFolder?: (id: string, name: string) => void;
   /** Deleting a folder keeps its documents — they return to the top level. */
   onDeleteFolder?: (id: string) => void;
@@ -248,6 +259,7 @@ function SidebarImpl({
   onRenameFolder,
   onDeleteFolder,
   onMoveFileToFolder,
+  onMoveFolderToFolder,
   saved,
   currentWorkspaceName,
   canDeleteWorkspace,
@@ -335,10 +347,14 @@ function SidebarImpl({
     });
   };
 
-  const promptNewFolder = () => {
+  const promptNewFolder = (parentId?: string | null) => {
     const name = window.prompt("Folder name:", "New folder");
-    if (name && name.trim()) onCreateFolder?.(name.trim());
+    if (name && name.trim()) onCreateFolder?.(name.trim(), parentId ?? null);
   };
+
+  // Folder currently being dragged, so a row is never offered as a drop target
+  // for itself and the root zone doesn't light up under its own drag.
+  const [draggingFolderId, setDraggingFolderId] = useState<string | null>(null);
 
   // "Create" opens a small File/Folder menu; "view" picks what the list below
   // shows. Both are click-away dropdowns anchored to their own button.
@@ -455,26 +471,174 @@ function SidebarImpl({
   const rootFiles = sorted.filter((f) => !f.folderId || !knownFolderIds.has(f.folderId));
   const listed = showFolders ? rootFiles : sorted;
 
-  /** Drop handlers that file a dragged document into `folderId` (null = top). */
+  /**
+   * Drop handlers for `folderId` (null = top level).
+   *
+   * Accepts both drags: a document being filed, and a folder being re-parented.
+   * `stopPropagation` on the drop matters now that folders nest — without it a
+   * drop on a child folder would bubble to every ancestor's handler and the
+   * outermost one would win.
+   */
   const dropTargetProps = (folderId: string | null) => {
-    if (!onMoveFileToFolder) return {};
+    if (!onMoveFileToFolder && !onMoveFolderToFolder) return {};
+    const accepts = (e: React.DragEvent) =>
+      (!!onMoveFileToFolder && e.dataTransfer.types.includes(FILE_DND)) ||
+      (!!onMoveFolderToFolder && e.dataTransfer.types.includes(FOLDER_DND));
     return {
       onDragOver: (e: React.DragEvent) => {
-        if (!e.dataTransfer.types.includes(FILE_DND)) return;
+        if (!accepts(e)) return;
         e.preventDefault();
+        e.stopPropagation();
         e.dataTransfer.dropEffect = "move" as const;
         setDropFolderId(folderId);
       },
       onDragLeave: () => setDropFolderId((current) => (current === folderId ? null : current)),
       onDrop: (e: React.DragEvent) => {
+        if (!accepts(e)) return;
         const fileId = e.dataTransfer.getData(FILE_DND);
+        const draggedFolder = e.dataTransfer.getData(FOLDER_DND);
         setDropFolderId(null);
-        if (!fileId) return;
+        if (!fileId && !draggedFolder) return;
         e.preventDefault();
         e.stopPropagation();
-        onMoveFileToFolder(fileId, folderId);
+        if (fileId) onMoveFileToFolder?.(fileId, folderId);
+        // A folder dropped on itself is a no-op rather than a cycle; the parent
+        // guards the deeper case (dropping onto one's own descendant).
+        else if (draggedFolder && draggedFolder !== folderId) {
+          onMoveFolderToFolder?.(draggedFolder, folderId);
+        }
       },
     };
+  };
+
+  /**
+   * The folder tree, derived from the flat list.
+   *
+   * A folder whose parent is missing — deleted, or never written by an older
+   * build — is treated as a root rather than dropped, so nothing it holds can
+   * become unreachable.
+   */
+  const childrenOf = (parentId: string | null) =>
+    folders.filter((f) => {
+      const parent = f.parentId ?? null;
+      if (parent === parentId) return true;
+      return parentId === null && parent !== null && !knownFolderIds.has(parent);
+    });
+  const rootFolders = childrenOf(null);
+
+  /**
+   * One folder and everything under it.
+   *
+   * Recursive rather than a flattened list with an indent level: the nesting is
+   * what makes a drop land in the right folder, and each level owns its own
+   * drop target and collapse state. `depth` only guards against a cycle that
+   * survived the parent's checks — a corrupt import, say — so the sidebar
+   * cannot be made to recurse forever.
+   */
+  const renderFolder = (folder: SidebarFolder, depth: number): React.ReactNode => {
+    if (depth > 12) return null;
+    const items = sorted.filter((f) => f.folderId === folder.id);
+    const subfolders = childrenOf(folder.id);
+    const collapsed = collapsedFolders.has(folder.id);
+    const isDropTarget = dropFolderId === folder.id && draggingFolderId !== folder.id;
+    const count = items.length + subfolders.length;
+    return (
+      <div
+        key={folder.id}
+        className={`mb-1.5 rounded-lg ${isDropTarget ? "ring-2 ring-primary/60" : ""} ${
+          draggingFolderId === folder.id ? "opacity-40" : ""
+        }`}
+        {...dropTargetProps(folder.id)}
+      >
+        <div
+          className="group flex items-center gap-1 rounded-lg px-1"
+          draggable={!!onMoveFolderToFolder && !selecting}
+          onDragStart={
+            onMoveFolderToFolder && !selecting
+              ? (e) => {
+                  e.stopPropagation();
+                  e.dataTransfer.setData(FOLDER_DND, folder.id);
+                  e.dataTransfer.effectAllowed = "move";
+                  setDraggingFolderId(folder.id);
+                }
+              : undefined
+          }
+          onDragEnd={
+            onMoveFolderToFolder && !selecting
+              ? () => {
+                  setDraggingFolderId(null);
+                  setDropFolderId(null);
+                }
+              : undefined
+          }
+        >
+          <button
+            onClick={() => toggleFolder(folder.id)}
+            className="flex min-w-0 flex-1 items-center gap-2 rounded-md py-2 pl-2 pr-1.5 text-left"
+            aria-expanded={!collapsed}
+          >
+            <ChevronRight
+              className={`h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform ${
+                collapsed ? "" : "rotate-90"
+              }`}
+              aria-hidden
+            />
+            {collapsed ? (
+              <Folder className="h-3.5 w-3.5 shrink-0 text-muted-foreground/70" aria-hidden />
+            ) : (
+              <FolderOpen className="h-3.5 w-3.5 shrink-0 text-muted-foreground/70" aria-hidden />
+            )}
+            <span className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground/80">
+              {folder.name}
+            </span>
+            <span className="shrink-0 text-xs tabular-nums text-muted-foreground">{count}</span>
+          </button>
+          <FolderMenu
+            onNewFile={onCreateFile ? () => onCreateFile(folder.id) : undefined}
+            onNewMermaid={onCreateMermaid ? () => onCreateMermaid(folder.id) : undefined}
+            onNewBoard={onCreateBoard ? () => onCreateBoard(folder.id) : undefined}
+            // Creates *inside* this folder now, rather than another one beside
+            // it at the top level.
+            onNewFolder={onCreateFolder ? () => promptNewFolder(folder.id) : undefined}
+            onRename={
+              onRenameFolder
+                ? () => {
+                    const next = window.prompt("Rename folder to:", folder.name);
+                    if (next && next.trim() && next.trim() !== folder.name) {
+                      onRenameFolder(folder.id, next.trim());
+                    }
+                  }
+                : undefined
+            }
+            onDelete={
+              onDeleteFolder
+                ? () => {
+                    if (
+                      count === 0 ||
+                      window.confirm(
+                        `Delete "${folder.name}"? Its ${count} item${
+                          count > 1 ? "s" : ""
+                        } move back to the top level.`,
+                      )
+                    ) {
+                      onDeleteFolder(folder.id);
+                    }
+                  }
+                : undefined
+            }
+          />
+        </div>
+        {!collapsed && (
+          <div className="ml-4 border-l border-border pl-1">
+            {subfolders.map((child) => renderFolder(child, depth + 1))}
+            {items.map(renderFileRow)}
+            {count === 0 && (
+              <p className="px-2 py-2 text-xs text-muted-foreground">Empty — drag a file here.</p>
+            )}
+          </div>
+        )}
+      </div>
+    );
   };
 
   const groups =
@@ -871,97 +1035,19 @@ function SidebarImpl({
           )
         ) : total === 0 && folders.length === 0 ? null : (
           <>
-            {showFolders &&
-              folders.map((folder) => {
-                const items = sorted.filter((f) => f.folderId === folder.id);
-                const collapsed = collapsedFolders.has(folder.id);
-                const isDropTarget = dropFolderId === folder.id;
-                return (
-                  <div
-                    key={folder.id}
-                    className={`mb-1.5 rounded-lg ${isDropTarget ? "ring-2 ring-primary/60" : ""}`}
-                    {...dropTargetProps(folder.id)}
-                  >
-                    <div className="group flex items-center gap-1 rounded-lg px-1">
-                      <button
-                        onClick={() => toggleFolder(folder.id)}
-                        className="flex min-w-0 flex-1 items-center gap-2 rounded-md py-2 pl-2 pr-1.5 text-left"
-                        aria-expanded={!collapsed}
-                      >
-                        <ChevronRight
-                          className={`h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform ${
-                            collapsed ? "" : "rotate-90"
-                          }`}
-                          aria-hidden
-                        />
-                        {collapsed ? (
-                          <Folder
-                            className="h-3.5 w-3.5 shrink-0 text-muted-foreground/70"
-                            aria-hidden
-                          />
-                        ) : (
-                          <FolderOpen
-                            className="h-3.5 w-3.5 shrink-0 text-muted-foreground/70"
-                            aria-hidden
-                          />
-                        )}
-                        <span className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground/80">
-                          {folder.name}
-                        </span>
-                        <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
-                          {items.length}
-                        </span>
-                      </button>
-                      <FolderMenu
-                        onNewFile={onCreateFile ? () => onCreateFile(folder.id) : undefined}
-                        onNewMermaid={
-                          onCreateMermaid ? () => onCreateMermaid(folder.id) : undefined
-                        }
-                        onNewBoard={onCreateBoard ? () => onCreateBoard(folder.id) : undefined}
-                        onNewFolder={onCreateFolder ? promptNewFolder : undefined}
-                        onRename={
-                          onRenameFolder
-                            ? () => {
-                                const next = window.prompt("Rename folder to:", folder.name);
-                                if (next && next.trim() && next.trim() !== folder.name) {
-                                  onRenameFolder(folder.id, next.trim());
-                                }
-                              }
-                            : undefined
-                        }
-                        onDelete={
-                          onDeleteFolder
-                            ? () => {
-                                if (
-                                  items.length === 0 ||
-                                  window.confirm(
-                                    `Delete "${folder.name}"? Its ${items.length} file${
-                                      items.length > 1 ? "s" : ""
-                                    } move back to the top level.`,
-                                  )
-                                ) {
-                                  onDeleteFolder(folder.id);
-                                }
-                              }
-                            : undefined
-                        }
-                      />
-                    </div>
-                    {!collapsed && (
-                      <div className="ml-4 border-l border-border pl-1">
-                        {items.length === 0 ? (
-                          <p className="px-2 py-2 text-xs text-muted-foreground">
-                            Empty — drag a file here.
-                          </p>
-                        ) : (
-                          items.map(renderFileRow)
-                        )}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            <div {...(showFolders ? dropTargetProps(null) : {})}>
+            {showFolders && rootFolders.map((folder) => renderFolder(folder, 0))}
+            {/* The top level's own drop target, and the reason a file can be
+                dragged back out of a folder: it wraps the unfiled list *and*
+                the empty space below it, so the gap under the last row is a
+                real place to drop rather than dead pixels. */}
+            <div
+              className={`min-h-16 rounded-lg ${
+                showFolders && dropFolderId === null && draggingFolderId === null
+                  ? "ring-2 ring-primary/60"
+                  : ""
+              }`}
+              {...(showFolders ? dropTargetProps(null) : {})}
+            >
               {groups.map((groupItem) => (
                 <div key={groupItem.label || "__all"} className={groupItem.label ? "mb-3" : ""}>
                   {groupItem.label && (

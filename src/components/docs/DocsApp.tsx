@@ -1250,17 +1250,42 @@ flowchart LR
   );
 
   const createFolder = useCallback(
-    (name: string) => {
+    (name: string, parentId?: string | null) => {
       const trimmed = name.trim();
       if (!trimmed) return;
       const folder: FolderRecord = {
         id: crypto.randomUUID(),
         name: trimmed,
         createdAt: Date.now(),
+        parentId: parentId ?? null,
       };
       setFolders((prev) => [...prev, folder]);
       markDirty();
       toast.success(`Created folder "${trimmed}"`);
+    },
+    [markDirty],
+  );
+
+  /**
+   * Re-parent a folder, refusing moves that would detach a subtree.
+   *
+   * Dropping a folder onto its own descendant would leave that whole branch
+   * pointing in a loop — unreachable from the top level, and invisible in a
+   * sidebar that renders downward from the roots.
+   */
+  const moveFolderToFolder = useCallback(
+    (folderId: string, parentId: string | null) => {
+      if (folderId === parentId) return;
+      setFolders((prev) => {
+        if (parentId) {
+          const parentOf = new Map(prev.map((f) => [f.id, f.parentId ?? null]));
+          for (let at: string | null = parentId; at; at = parentOf.get(at) ?? null) {
+            if (at === folderId) return prev;
+          }
+        }
+        return prev.map((f) => (f.id === folderId ? { ...f, parentId } : f));
+      });
+      markDirty();
     },
     [markDirty],
   );
@@ -1275,10 +1300,20 @@ flowchart LR
     [markDirty],
   );
 
-  /** Deleting a folder keeps its documents — they move back to the top level. */
+  /**
+   * Deleting a folder keeps everything inside it.
+   *
+   * Its documents return to the top level, and so do any folders nested under
+   * it — re-parenting the children rather than deleting the subtree, so a
+   * mis-click never takes a branch of the workspace with it.
+   */
   const deleteFolder = useCallback(
     (id: string) => {
-      setFolders((prev) => prev.filter((f) => f.id !== id));
+      setFolders((prev) =>
+        prev
+          .filter((f) => f.id !== id)
+          .map((f) => (f.parentId === id ? { ...f, parentId: null } : f)),
+      );
       setFiles((prev) => prev.map((f) => (f.folderId === id ? { ...f, folderId: null } : f)));
       markDirty();
     },
@@ -2493,6 +2528,7 @@ flowchart LR
                 onRenameFolder={renameFolder}
                 onDeleteFolder={deleteFolder}
                 onMoveFileToFolder={moveFileToFolder}
+                onMoveFolderToFolder={moveFolderToFolder}
                 onReorderFile={reorderFile}
                 onSortByName={sortFilesByName}
                 view={sidebarView}
@@ -2625,6 +2661,7 @@ flowchart LR
                     onRenameFolder={renameFolder}
                     onDeleteFolder={deleteFolder}
                     onMoveFileToFolder={moveFileToFolder}
+                    onMoveFolderToFolder={moveFolderToFolder}
                     onReorderFile={reorderFile}
                     onSortByName={sortFilesByName}
                     view={sidebarView}

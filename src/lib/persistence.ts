@@ -32,6 +32,15 @@ export interface FolderRecord {
   id: string;
   name: string;
   createdAt: number;
+  /**
+   * Folder this one sits inside; null/undefined = top level.
+   *
+   * Nesting is stored the same way filing is: a flat list with a pointer up,
+   * rather than folders containing folders. A record whose parent is missing
+   * (deleted, or dropped by an older build that never wrote this field) is
+   * rendered at the top level instead of disappearing with its documents.
+   */
+  parentId?: string | null;
 }
 
 export interface PersistedUI {
@@ -369,12 +378,15 @@ export function parseWorkspaceImport(json: string): WorkspaceRecord {
         folderId: typeof f.folderId === "string" ? f.folderId : null,
       })),
     folders: Array.isArray(w.folders)
-      ? (w.folders as Partial<FolderRecord>[])
+      ? (w.folders as Partial<FolderRecord & { parentId?: unknown }>[])
           .filter((f) => f && typeof f.id === "string" && typeof f.name === "string")
           .map((f) => ({
             id: f.id as string,
             name: f.name as string,
             createdAt: typeof f.createdAt === "number" ? f.createdAt : now,
+            // Nesting has to survive a share link or a re-import. Dropping this
+            // would silently flatten every subfolder into the top level.
+            parentId: typeof f.parentId === "string" ? f.parentId : null,
           }))
       : [],
     bookmarks: Array.isArray(w.bookmarks)
