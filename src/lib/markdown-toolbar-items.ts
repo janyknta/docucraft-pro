@@ -21,6 +21,7 @@ import {
   Quote,
   SquareCode,
   Strikethrough,
+  Workflow,
 } from "lucide-react";
 import type { FormatAction } from "./markdown-format";
 import * as md from "./markdown-format";
@@ -77,6 +78,7 @@ export const TOOLBAR_GROUPS: ToolbarItem[][] = [
     { icon: Quote, label: "Blockquote", action: md.blockquote, shortcut: "Mod+Shift+." },
     { icon: Code, label: "Inline code", action: md.inlineCode, shortcut: "Mod+E" },
     { icon: SquareCode, label: "Code block", action: md.codeBlock, shortcut: "Mod+Alt+C" },
+    { icon: Workflow, label: "Mermaid diagram", action: md.mermaidBlock, shortcut: "Mod+Alt+M" },
   ],
   [
     { icon: Link, label: "Link", action: md.link, shortcut: "Mod+K" },

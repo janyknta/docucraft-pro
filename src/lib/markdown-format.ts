@@ -202,6 +202,30 @@ export const codeBlock: FormatAction = (state) => {
 export const horizontalRule: FormatAction = insertBlock("---", 3);
 
 /**
+ * Wrap the selection in a ```mermaid fence, or drop an empty one at the caret.
+ *
+ * Separate from `codeBlock` because a diagram is not a language tag the reader
+ * types after the fact: the fence and its `mermaid` info string are what make
+ * the viewer draw the block at all, so the whole thing is one action.
+ */
+export const mermaidBlock: FormatAction = (state) => {
+  const { text, start, end } = state;
+  const selected = text.slice(start, end);
+  // Fences have to start their own line, or the surrounding paragraph swallows
+  // them. Only add the separating newlines that aren't already there.
+  const before = start === 0 || text[start - 1] === "\n" ? "" : "\n";
+  const after = end === text.length || text[end] === "\n" ? "" : "\n";
+  const body = selected || "graph TD\n  A[Start] --> B[End]";
+  const block = `${before}\`\`\`mermaid\n${body}\n\`\`\`${after}`;
+  const bodyStart = start + before.length + "```mermaid\n".length;
+  return {
+    text: text.slice(0, start) + block + text.slice(end),
+    start: bodyStart,
+    end: bodyStart + body.length,
+  };
+};
+
+/**
  * Link and image share a shape: `[text](url)` and `![alt](url)`.
  *
  * A selection that looks like a URL becomes the target and the caret lands on

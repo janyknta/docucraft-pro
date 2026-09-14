@@ -189,6 +189,10 @@ export function Mermaid({
   mode?: MermaidMode;
 }) {
   const [fullscreen, setFullscreen] = useState(false);
+  // Raw mode draws a plain SVG with no pan/zoom handler behind it — the
+  // animated stages get theirs from the animator. Scaling the host box is the
+  // equivalent that works for a static diagram, inline and fullscreen alike.
+  const [rawZoom, setRawZoom] = useState(1);
   const [mode, setMode] = useState<MermaidMode>(initialMode);
   const [dark, setDark] = useState(
     () => typeof document !== "undefined" && document.documentElement.classList.contains("dark"),
@@ -260,6 +264,11 @@ export function Mermaid({
   // changes so editing the diagram — or switching renderer — immediately gets a
   // fresh render attempt rather than staying stuck on the previous failure.
   useEffect(() => setRenderError(null), [source, dark, mode]);
+
+  // A zoom belongs to the diagram it was applied to. Leaving it set across an
+  // edit or a mode switch would re-open the next render already magnified, with
+  // no indication why.
+  useEffect(() => setRawZoom(1), [source, mode]);
 
   useEffect(() => {
     if (!fullscreen) return;
@@ -341,6 +350,24 @@ export function Mermaid({
   const visibleMode = performanceMode ? "raw" : mode;
   const modeControl = <ModeTabs mode={visibleMode} onChange={setMode} unavailable={unavailable} />;
 
+  // Kept inside the same bounds the animated stages use, so a diagram cannot be
+  // zoomed into a state the other modes could not show.
+  const rawZoomBy = (factor: number) =>
+    setRawZoom((z) => Math.min(ZOOM_LIMIT.max, Math.max(ZOOM_LIMIT.min, z * factor)));
+  const rawZoomControls = (
+    <>
+      <TrayButton onClick={() => rawZoomBy(1 / 1.3)} label="Zoom out">
+        <Minus className="h-3.5 w-3.5" />
+      </TrayButton>
+      <TrayButton onClick={() => setRawZoom(1)} label="Fit diagram">
+        <span className="text-[10px] font-semibold tabular-nums">{Math.round(rawZoom * 100)}%</span>
+      </TrayButton>
+      <TrayButton onClick={() => rawZoomBy(1.3)} label="Zoom in">
+        <Plus className="h-3.5 w-3.5" />
+      </TrayButton>
+    </>
+  );
+
   // An unsupported diagram still has to show something: render it raw while
   // leaving the reader's chosen tab alone.
   const effectiveMode: MermaidMode =
@@ -370,6 +397,10 @@ export function Mermaid({
       <Tray>
         {saveControl}
         {effectiveMode === "flow" ? downloadControl : null}
+        {/* Raw is the one mode with no pan/zoom handler of its own, so it gets
+            these. The animated stages carry their own pair down on the
+            artwork. */}
+        {effectiveMode === "raw" ? rawZoomControls : null}
         <TrayButton onClick={() => setFullscreen(true)} label="Fullscreen">
           <Expand className="h-3.5 w-3.5" />
         </TrayButton>
@@ -405,6 +436,7 @@ export function Mermaid({
           colored={colored && !performanceMode}
           fill={stageFill}
           controls={controls}
+          zoom={rawZoom}
           onError={setRenderError}
           onRatio={stageFill ? undefined : setStageRatio}
           performanceMode={performanceMode}
@@ -480,6 +512,7 @@ export function Mermaid({
                   <Tray>
                     {saveControl}
                     {effectiveMode === "flow" ? downloadControl : null}
+                    {effectiveMode === "raw" ? rawZoomControls : null}
                   </Tray>
                   <Tray key="close">
                     <TrayButton onClick={() => setFullscreen(false)} label="Close diagram">
@@ -769,6 +802,7 @@ function StaticStage({
   colored,
   fill,
   controls,
+  zoom = 1,
   onError,
   onRatio,
   performanceMode,
@@ -781,6 +815,8 @@ function StaticStage({
   colored?: boolean;
   fill?: boolean;
   controls?: React.ReactNode;
+  /** Scale factor from the tray's zoom controls; 1 is the fitted diagram. */
+  zoom?: number;
   onError: (message: string | null) => void;
   onRatio?: (ratio: number) => void;
   performanceMode?: boolean;
@@ -1000,15 +1036,26 @@ function StaticStage({
           <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> Rendering diagram…
         </div>
       )}
-      <div
-        ref={hostRef}
-        onClick={onHostClick}
-        data-tall={!fill && ratio && isTallStage(ratio) ? "" : undefined}
-        className={`${fill ? "h-full min-h-0 w-full" : "w-full box-content"}${
-          colored ? " diagram-colored" : ""
-        }`}
-        style={fill ? undefined : stageBoxStyle(ratio ?? 0.42, TRAY_GUTTER, size ?? undefined)}
-      />
+      {/* Zoom scales the diagram inside a clipping box rather than growing the
+          stage, so a magnified diagram is panned to by scrolling this box and
+          the surrounding document never reflows. Transform, not width/height:
+          it stays on the compositor and does not restyle the SVG's nodes. */}
+      <div className={zoom > 1 ? "h-full w-full overflow-auto" : "contents"}>
+        <div
+          ref={hostRef}
+          onClick={onHostClick}
+          data-tall={!fill && ratio && isTallStage(ratio) ? "" : undefined}
+          className={`${fill ? "h-full min-h-0 w-full" : "w-full box-content"}${
+            colored ? " diagram-colored" : ""
+          }`}
+          style={{
+            ...(fill ? undefined : stageBoxStyle(ratio ?? 0.42, TRAY_GUTTER, size ?? undefined)),
+            ...(zoom === 1
+              ? undefined
+              : { transform: `scale(${zoom})`, transformOrigin: "top left" }),
+          }}
+        />
+      </div>
       {picker && (
         <DiagramNodeColorPopover
           anchor={picker.rect}

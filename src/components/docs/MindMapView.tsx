@@ -209,7 +209,9 @@ export function MindMapView({
   const selectedBranch = (edge: Edge) =>
     Boolean(selected && selected.startsWith(`${edge.from.node.id}.`));
   return (
-    <div className={`relative isolate overflow-hidden bg-background ${embedded ? "border-y border-border/70" : ""}`}>
+    <div
+      className={`relative isolate overflow-hidden bg-background ${embedded ? "border-y border-border/70" : ""}`}
+    >
       <div
         ref={frameRef}
         onPointerDown={onPointerDown}
@@ -319,14 +321,16 @@ function Inspector({ node, onClose }: { node: MindMapNode; onClose: () => void }
       </div>
       <div className="max-h-[min(50dvh,26rem)] overflow-y-auto border-t border-border px-4 py-3">
         {description ? (
-          <p className="text-sm leading-6 text-foreground">{description.value}</p>
+          <p className="whitespace-pre-wrap wrap-break-word text-sm leading-6 text-foreground">
+            {description.value}
+          </p>
         ) : null}
         {attributes.length > 0 && (
           <dl className={description ? "mt-4 space-y-3 border-t border-border pt-3" : "space-y-3"}>
             {attributes.map((entry) => (
               <div key={entry.label}>
                 <dt className="text-xs font-medium text-muted-foreground">{entry.label}</dt>
-                <dd className="mt-1 whitespace-pre-wrap break-words text-sm leading-5 text-foreground">
+                <dd className="mt-1 whitespace-pre-wrap wrap-break-word text-sm leading-5 text-foreground">
                   {entry.value}
                 </dd>
               </div>

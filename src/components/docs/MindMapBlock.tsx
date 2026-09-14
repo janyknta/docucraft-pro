@@ -1,4 +1,5 @@
-import { Suspense, lazy, useMemo } from "react";
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
+import { Expand, Minimize2 } from "lucide-react";
 import { buildMindMap } from "@/lib/mindmap";
 
 /**
@@ -68,13 +69,63 @@ export function MindMapBlock({ code, title }: { code: string; title?: string }) 
     );
   }
 
+  return <MindMapFigure tree={tree} />;
+}
+
+/**
+ * The map plus the control that takes it full screen.
+ *
+ * Fullscreen is the element's own, not an overlay div: a mind map embedded in a
+ * document gets a few hundred pixels of a text column, which is the one place
+ * it is least readable. The real Fullscreen API hands the map the whole display
+ * and keeps it the same live component — so the open branches, the selection
+ * and the inspector all survive going in and coming back out.
+ */
+function MindMapFigure({ tree }: { tree: NonNullable<ReturnType<typeof buildMindMap>> }) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const [full, setFull] = useState(false);
+
+  // Driven by the event, not by the click: Escape and the browser's own exit
+  // leave fullscreen without going through the button, and the state has to
+  // follow the document either way.
+  useEffect(() => {
+    const sync = () => setFull(document.fullscreenElement === hostRef.current);
+    document.addEventListener("fullscreenchange", sync);
+    return () => document.removeEventListener("fullscreenchange", sync);
+  }, []);
+
+  const toggle = () => {
+    const el = hostRef.current;
+    if (!el) return;
+    if (document.fullscreenElement === el) void document.exitFullscreen();
+    else void el.requestFullscreen?.().catch(() => setFull(false));
+  };
+
   return (
-    <div className="my-6 overflow-hidden rounded-xl border border-border">
-      <Suspense fallback={<MapPlaceholder />}>
-        {/* Bounded height: inside a document the map is a figure, not a page,
-            and it must not grow past the text it belongs to. */}
-        <MindMapView tree={tree} embedded />
-      </Suspense>
+    <div
+      ref={hostRef}
+      className={`my-6 overflow-hidden rounded-xl border border-border bg-background ${
+        full ? "my-0 flex h-screen w-screen flex-col rounded-none border-0" : ""
+      }`}
+    >
+      <div className="flex items-center justify-end border-b border-border/70 bg-background/40 px-2 py-1.5">
+        <button
+          onClick={toggle}
+          title={full ? "Exit full screen" : "Full screen"}
+          aria-label={full ? "Exit full screen" : "Full screen"}
+          className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+        >
+          {full ? <Minimize2 className="h-3.5 w-3.5" /> : <Expand className="h-3.5 w-3.5" />}
+        </button>
+      </div>
+      <div className={full ? "min-h-0 flex-1" : ""}>
+        <Suspense fallback={<MapPlaceholder />}>
+          {/* Bounded height: inside a document the map is a figure, not a page,
+              and it must not grow past the text it belongs to. Full screen is
+              the exception, and there it fills what it is given. */}
+          <MindMapView tree={tree} embedded={!full} />
+        </Suspense>
+      </div>
     </div>
   );
 }
