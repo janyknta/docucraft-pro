@@ -61,6 +61,22 @@ export interface FolderRecord {
   parentId?: string | null;
 }
 
+/**
+ * One column of the reader, holding its own ordered tabs.
+ *
+ * Panes own their tabs and the app derives the single "active file" from
+ * whichever pane has focus. That way the sidebar, the command palette, stars
+ * and the nav trail all keep asking the same question they always did, and
+ * only the answer's source changes.
+ */
+export interface PersistedPane {
+  id: string;
+  /** File ids, in tab order. */
+  tabs: string[];
+  /** Which of `tabs` is on screen in this pane. */
+  activeTabId: string | null;
+}
+
 export interface PersistedUI {
   activeFileId: string | null;
   expanded: Record<string, boolean>;
@@ -69,6 +85,13 @@ export interface PersistedUI {
   fileOrder?: string[];
   /** File ids in most-recently-opened order — drives the "Recent" chip. */
   recentFileIds?: string[];
+  /**
+   * Split layout. Absent or empty in a workspace written before panes existed,
+   * which reads as a single pane holding `activeFileId` — so an older workspace
+   * opens exactly as it used to.
+   */
+  panes?: PersistedPane[];
+  focusedPaneId?: string | null;
 }
 
 import type { Highlight } from "./dom-highlighter";
@@ -220,6 +243,8 @@ export function emptyUI(): PersistedUI {
     scrollTop: 0,
     fileOrder: [],
     recentFileIds: [],
+    panes: [],
+    focusedPaneId: null,
   };
 }
 
@@ -418,6 +443,18 @@ export function parseWorkspaceImport(json: string): WorkspaceRecord {
       scrollTop: typeof w.ui?.scrollTop === "number" ? w.ui.scrollTop : 0,
       fileOrder: Array.isArray(w.ui?.fileOrder) ? w.ui.fileOrder : [],
       recentFileIds: Array.isArray(w.ui?.recentFileIds) ? w.ui.recentFileIds : [],
+      // The split layout has to survive a reload or a share link. Dropping it
+      // here would silently collapse every workspace back to one pane.
+      panes: Array.isArray(w.ui?.panes)
+        ? (w.ui.panes as Partial<PersistedPane>[])
+            .filter((pane) => pane && typeof pane.id === "string" && Array.isArray(pane.tabs))
+            .map((pane) => ({
+              id: pane.id as string,
+              tabs: (pane.tabs as unknown[]).filter((id): id is string => typeof id === "string"),
+              activeTabId: typeof pane.activeTabId === "string" ? pane.activeTabId : null,
+            }))
+        : [],
+      focusedPaneId: typeof w.ui?.focusedPaneId === "string" ? w.ui.focusedPaneId : null,
     },
   };
 }

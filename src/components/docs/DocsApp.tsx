@@ -1,4 +1,4 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import {
   BookOpen,
@@ -22,6 +22,20 @@ import {
 } from "@/hooks/use-nav-history";
 import { Sidebar, AddMenu, DEFAULT_VIEW, type SidebarView } from "./Sidebar";
 import { MarkdownViewer } from "./MarkdownViewer";
+import { PaneTabs } from "./PaneTabs";
+import { PaneDocument } from "./PaneDocument";
+import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
+import {
+  activeFileOf,
+  closeTab,
+  hydratePanes,
+  moveTab,
+  openInPane,
+  singlePane,
+  splitPane,
+  toPersisted,
+  type PaneLayout,
+} from "@/lib/panes";
 import { WorkspaceMenu } from "./WorkspaceMenu";
 import { WorkspaceSheet } from "./WorkspaceSheet";
 import type { AskAiPrefill } from "./ai/AskAiPanel";
@@ -251,7 +265,70 @@ export function DocsApp() {
   // which one it sits in, so folders can appear and disappear without touching
   // the documents themselves.
   const [folders, setFolders] = useState<FolderRecord[]>([]);
-  const [activeFileId, setActiveFileId] = useState<string | null>(null);
+  /**
+   * The split layout. Panes own their tabs; the app's single "active file" is
+   * derived from whichever pane has focus.
+   *
+   * Deriving it rather than storing it separately is what keeps this change
+   * small: the sidebar, the command palette, stars, the nav trail and the
+   * persistence snapshot all still read one `activeFileId`, and none of them
+   * has to learn what a pane is. `setActiveFileId` survives as a shim that
+   * opens the file in the focused pane, so every existing caller is unchanged.
+   */
+  const [paneLayout, setPaneLayout] = useState<PaneLayout>(() => singlePane(null));
+  const activeFileId = activeFileOf(paneLayout);
+  const setActiveFileId = useCallback((fileId: string | null) => {
+    setPaneLayout((layout) => {
+      if (fileId === null) {
+        // Closing the last document rather than opening one: clear the focused
+        // pane's selection without disturbing the other panes' tabs.
+        return {
+          ...layout,
+          panes: layout.panes.map((pane) =>
+            pane.id === layout.focusedPaneId ? { ...pane, activeTabId: null } : pane,
+          ),
+        };
+      }
+      return openInPane(layout, fileId);
+    });
+  }, []);
+
+  // `markDirty` is declared much further down, after the persistence machinery
+  // it belongs to. These callbacks sit up here with the pane state they act on,
+  // so they reach it through a ref rather than forcing either block to move.
+  const markDirtyRef = useRef<() => void>(() => {});
+
+  /** Which pane the reader is working in — clicking anywhere in one focuses it. */
+  const focusPane = useCallback((paneId: string) => {
+    setPaneLayout((layout) =>
+      layout.focusedPaneId === paneId ? layout : { ...layout, focusedPaneId: paneId },
+    );
+  }, []);
+
+  /** Show an already-open tab in its pane. */
+  const selectTab = useCallback((paneId: string, fileId: string) => {
+    setPaneLayout((layout) => openInPane(layout, fileId, paneId));
+  }, []);
+
+  const closePaneTab = useCallback((paneId: string, fileId: string) => {
+    setPaneLayout((layout) => closeTab(layout, paneId, fileId));
+    markDirtyRef.current();
+  }, []);
+
+  /** Split a pane in two, the new one showing the same document to start with. */
+  const splitFromPane = useCallback((paneId: string) => {
+    setPaneLayout((layout) => splitPane(layout, paneId, null));
+    markDirtyRef.current();
+  }, []);
+
+  /** A tab was dragged onto a pane — from another pane, or reordered in place. */
+  const dropTabIntoPane = useCallback(
+    (fromPaneId: string, fileId: string, toPaneId: string, toIndex: number) => {
+      setPaneLayout((layout) => moveTab(layout, fromPaneId, fileId, toPaneId, toIndex));
+      markDirtyRef.current();
+    },
+    [],
+  );
   // A just-created blank document: the viewer opens straight into its editor so
   // the reader can paste markdown in without hunting for the Edit button.
   const [autoEditFileId, setAutoEditFileId] = useState<string | null>(null);
@@ -349,6 +426,7 @@ export function DocsApp() {
     files,
     folders,
     activeFileId,
+    paneLayout,
     expanded,
     sidebarCollapsed,
     saved,
@@ -359,6 +437,7 @@ export function DocsApp() {
     files,
     folders,
     activeFileId,
+    paneLayout,
     expanded,
     sidebarCollapsed,
     saved,
@@ -634,6 +713,8 @@ export function DocsApp() {
         scrollTop: scrollRef.current,
         fileOrder: s.files.map((f) => f.id),
         recentFileIds: s.recentFileIds,
+        panes: toPersisted(s.paneLayout),
+        focusedPaneId: s.paneLayout.focusedPaneId,
       },
     };
   }, []);
@@ -674,6 +755,9 @@ export function DocsApp() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => void persistNow(false), 700);
   }, [persistNow]);
+  // Published for the pane callbacks, which are declared above this point and
+  // would otherwise have to close over a variable that does not exist yet.
+  markDirtyRef.current = markDirty;
 
   const hydrateWorkspace = useCallback(
     (ws: WorkspaceRecord) => {
@@ -707,7 +791,17 @@ export function DocsApp() {
       setFiles(swept);
       setFolders(wsFolders);
       setAutoEditFileId(null);
-      setActiveFileId(ws.ui?.activeFileId ?? parsed[0]?.id ?? null);
+      // Panes come back with the workspace. A record written before panes
+      // existed has none, which hydrates as a single pane holding whatever was
+      // open — so an older workspace opens exactly as it used to.
+      setPaneLayout(
+        hydratePanes(
+          ws.ui?.panes,
+          ws.ui?.focusedPaneId,
+          new Set(swept.map((f) => f.id)),
+          ws.ui?.activeFileId ?? swept[0]?.id ?? null,
+        ),
+      );
       setRecentFileIds(ws.ui?.recentFileIds ?? []);
       setExpanded(ws.ui?.expanded ?? {});
       setSidebarCollapsed(!!ws.ui?.sidebarCollapsed);
@@ -2782,47 +2876,130 @@ flowchart LR
                   instead of stacking on top of whatever document was open. */}
               {showSaved ? (
                 savedPage
+              ) : paneLayout.panes.length > 1 ? (
+                /* Split view. Each pane carries its own tab strip and its own
+                   document; the focused pane is what the rest of the app means
+                   by "the active file", so nothing outside here has to know
+                   panes exist. */
+                <ResizablePanelGroup orientation="horizontal" className="h-full">
+                  {paneLayout.panes.map((pane, index) => {
+                    const paneFile = files.find((f) => f.id === pane.activeTabId) ?? null;
+                    return (
+                      <Fragment key={pane.id}>
+                        {index > 0 && <ResizableHandle withHandle />}
+                        <ResizablePanel
+                          defaultSize={`${Math.floor(100 / paneLayout.panes.length)}%`}
+                          minSize="20%"
+                        >
+                          <div
+                            onMouseDown={() => focusPane(pane.id)}
+                            className="flex h-full min-h-0 flex-col"
+                          >
+                            <PaneTabs
+                              pane={pane}
+                              files={files}
+                              focused={pane.id === paneLayout.focusedPaneId}
+                              onSelect={(fileId) => selectTab(pane.id, fileId)}
+                              onClose={(fileId) => closePaneTab(pane.id, fileId)}
+                              onFocus={() => focusPane(pane.id)}
+                              onSplit={() => splitFromPane(pane.id)}
+                              onDropTab={(fromPaneId, fileId, toIndex) =>
+                                dropTabIntoPane(fromPaneId, fileId, pane.id, toIndex)
+                              }
+                            />
+                            <div className="min-h-0 flex-1 overflow-y-auto px-4">
+                              {paneFile ? (
+                                <PaneDocument
+                                  file={paneFile}
+                                  files={files}
+                                  saved={saved}
+                                  highlights={highlights}
+                                  workspaceId={workspaceId}
+                                  workspaceRevision={workspaceRevision}
+                                  workspaceName={workspaceNameRef.current}
+                                  onContentChange={handleContentChange}
+                                  onAddHighlight={addHighlight}
+                                  onUpdateHighlight={updateHighlight}
+                                  onRemoveHighlight={removeHighlight}
+                                  onRepairHighlights={repairHighlights}
+                                  onToggleSaved={toggleSaved}
+                                  onRemoveSaved={removeSaved}
+                                  onOpenArtifact={openEmbeddedArtifact}
+                                  readingMode={readingMode}
+                                />
+                              ) : (
+                                <p className="px-2 py-16 text-center text-sm text-muted-foreground">
+                                  Nothing open in this pane. Drag a tab here, or pick a document
+                                  from the sidebar.
+                                </p>
+                              )}
+                            </div>
+                          </div>
+                        </ResizablePanel>
+                      </Fragment>
+                    );
+                  })}
+                </ResizablePanelGroup>
               ) : activeFile &&
                 (activeFile.kind === "markdown" ||
                   activeFile.kind === "text" ||
                   !activeFile.kind) ? (
-                <MarkdownViewer
-                  file={activeFile}
-                  prevFile={prevFile}
-                  nextFile={nextFile}
-                  onNav={navFromViewer}
-                  activeSubtopicId={activeHeadingId}
-                  highlightQuery={highlightQuery}
-                  onContentChange={handleContentChange}
-                  onEditorDirtyChange={(dirty) => {
-                    editorDirtyRef.current = dirty;
-                  }}
-                  startInEditFileId={autoEditFileId}
-                  onStartInEditConsumed={consumeStartInEdit}
-                  nextReadingMin={nextReadingMinutes}
-                  isBookmarked={!!activePageSaved}
-                  onToggleBookmark={toggleActivePageSaved}
-                  highlights={activeFileHighlights}
-                  onAddHighlight={addHighlightToActive}
-                  onUpdateHighlight={updateHighlight}
-                  onRemoveHighlight={removeHighlight}
-                  onRepairHighlights={repairHighlights}
-                  saved={activeFileSaved}
-                  onToggleSaved={toggleSavedOnActive}
-                  onRemoveSaved={removeSaved}
-                  pendingSaved={pendingSaved?.fileId === activeFile.id ? pendingSaved : null}
-                  onSavedShown={clearPendingSaved}
-                  onHome={goHome}
-                  onShareFile={shareActiveFile}
-                  onAskAi={aiEnabled ? askAiFromSelection : undefined}
-                  readingMode={readingMode}
-                  workspaceId={workspaceId}
-                  workspaceRevision={workspaceRevision}
-                  workspaceFiles={files}
-                  workspaceName={workspaceNameRef.current}
-                  onOpenArtifact={openEmbeddedArtifact}
-                  onOpenPalette={() => setPaletteOpen(true)}
-                />
+                <>
+                  {/* The single pane gets the same tab strip the split does.
+                      Without it there would be no way to reach a split at all —
+                      the control that creates one lives on the strip. */}
+                  {paneLayout.panes[0] && (
+                    <PaneTabs
+                      pane={paneLayout.panes[0]}
+                      files={files}
+                      focused
+                      onSelect={(fileId) => selectTab(paneLayout.panes[0].id, fileId)}
+                      onClose={(fileId) => closePaneTab(paneLayout.panes[0].id, fileId)}
+                      onFocus={() => focusPane(paneLayout.panes[0].id)}
+                      onSplit={() => splitFromPane(paneLayout.panes[0].id)}
+                      onDropTab={(fromPaneId, fileId, toIndex) =>
+                        dropTabIntoPane(fromPaneId, fileId, paneLayout.panes[0].id, toIndex)
+                      }
+                    />
+                  )}
+                  <MarkdownViewer
+                    file={activeFile}
+                    prevFile={prevFile}
+                    nextFile={nextFile}
+                    onNav={navFromViewer}
+                    activeSubtopicId={activeHeadingId}
+                    highlightQuery={highlightQuery}
+                    onContentChange={handleContentChange}
+                    onEditorDirtyChange={(dirty) => {
+                      editorDirtyRef.current = dirty;
+                    }}
+                    startInEditFileId={autoEditFileId}
+                    onStartInEditConsumed={consumeStartInEdit}
+                    nextReadingMin={nextReadingMinutes}
+                    isBookmarked={!!activePageSaved}
+                    onToggleBookmark={toggleActivePageSaved}
+                    highlights={activeFileHighlights}
+                    onAddHighlight={addHighlightToActive}
+                    onUpdateHighlight={updateHighlight}
+                    onRemoveHighlight={removeHighlight}
+                    onRepairHighlights={repairHighlights}
+                    saved={activeFileSaved}
+                    onToggleSaved={toggleSavedOnActive}
+                    onRemoveSaved={removeSaved}
+                    pendingSaved={pendingSaved?.fileId === activeFile.id ? pendingSaved : null}
+                    onSavedShown={clearPendingSaved}
+                    onHome={goHome}
+                    onShareFile={shareActiveFile}
+                    onAskAi={aiEnabled ? askAiFromSelection : undefined}
+                    readingMode={readingMode}
+                    workspaceId={workspaceId}
+                    workspaceRevision={workspaceRevision}
+                    workspaceFiles={files}
+                    workspaceName={workspaceNameRef.current}
+                    onOpenArtifact={openEmbeddedArtifact}
+                    onOpenPalette={() => setPaletteOpen(true)}
+                  />
+                </>
               ) : activeFile ? (
                 <DocumentViewer
                   file={activeFile}
