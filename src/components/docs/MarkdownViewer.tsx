@@ -885,7 +885,24 @@ function MarkdownViewerImpl({
 
   // Autosaving the draft is the editor's own concern now — see MarkdownEditor.
 
+  /**
+   * Back to the top of *this* document.
+   *
+   * In split view each pane is its own scroll container, so scrolling the
+   * window would move every column at once — and in the single-document reader
+   * the window is the scroller, so it still has to work there. Walk up from the
+   * viewer to whichever ancestor actually scrolls and move that one.
+   */
   const scrollToTop = () => {
+    let el: HTMLElement | null = containerRef.current;
+    while (el) {
+      const overflowY = getComputedStyle(el).overflowY;
+      if ((overflowY === "auto" || overflowY === "scroll") && el.scrollHeight > el.clientHeight) {
+        el.scrollTo({ top: 0, behavior: "smooth" });
+        return;
+      }
+      el = el.parentElement;
+    }
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 

@@ -50,6 +50,15 @@ const DocumentViewer = lazy(() =>
 const CommandPalette = lazy(() =>
   import("./CommandPalette").then((m) => ({ default: m.CommandPalette })),
 );
+/**
+ * How many columns the split view will go to.
+ *
+ * Not a design preference — a legibility floor. Past this, on any ordinary
+ * display, a column is narrower than a line of prose wants to be. A wide
+ * monitor comfortably carries four.
+ */
+const MAX_PANES = 4;
+
 const SavedPage = lazy(() => import("./SavedPage").then((m) => ({ default: m.SavedPage })));
 
 const SettingsPage = lazy(() =>
@@ -303,15 +312,6 @@ export function DocsApp() {
     );
   }, []);
 
-  /** Every document currently open, in the order the panes hold them. */
-  const openFileIds = useMemo(() => {
-    const seen: string[] = [];
-    for (const pane of paneLayout.panes) {
-      for (const id of pane.tabs) if (!seen.includes(id)) seen.push(id);
-    }
-    return seen;
-  }, [paneLayout]);
-
   /** What the side-by-side columns are showing, other than the focused one. */
   const splitFileIds = useMemo(
     () =>
@@ -327,25 +327,19 @@ export function DocsApp() {
     setPaneLayout((layout) => {
       const from = layout.focusedPaneId ?? layout.panes[0]?.id;
       if (!from) return openInPane(layout, fileId);
-      // Side by side means two columns, not a growing row of them. Once a
-      // second column exists it is where everything "beside" goes — otherwise
-      // reading three documents in turn would leave three narrowing panes
-      // nobody asked for.
-      const other = layout.panes.find((pane) => pane.id !== from);
-      if (other) return openInPane(layout, fileId, other.id);
-      return splitPane(layout, from, fileId);
-    });
-    markDirtyRef.current();
-  }, []);
-
-  /** Stop keeping a document open, wherever it is being shown. */
-  const closeOpenFile = useCallback((fileId: string) => {
-    setPaneLayout((layout) => {
-      let next = layout;
-      for (const pane of layout.panes) {
-        if (pane.tabs.includes(fileId)) next = closeTab(next, pane.id, fileId);
+      // Already in a column of its own: focus that one rather than opening a
+      // second copy of the same document.
+      const existing = layout.panes.find((pane) => pane.id !== from && pane.tabs.includes(fileId));
+      if (existing) return openInPane(layout, fileId, existing.id);
+      // Otherwise a new column. There is no two-column cap: on a wide display
+      // comparing four documents is the whole point. The ceiling is only what
+      // stays legible — below roughly this width a column is no longer reading,
+      // it is a sliver.
+      if (layout.panes.length >= MAX_PANES) {
+        const last = layout.panes[layout.panes.length - 1];
+        return openInPane(layout, fileId, last.id);
       }
-      return next;
+      return splitPane(layout, from, fileId);
     });
     markDirtyRef.current();
   }, []);
@@ -2743,11 +2737,8 @@ flowchart LR
                 onDeleteForever={deleteForever}
                 onOpenSettings={openSettings}
                 onOpenSavedPage={openSavedPage}
-                openFileIds={openFileIds}
-                currentOpenFileId={activeFileId}
+                onAddToSplit={openBeside}
                 splitFileIds={splitFileIds}
-                onOpenBeside={openBeside}
-                onCloseOpenFile={closeOpenFile}
                 onAskAi={aiEnabled ? openAskAi : undefined}
                 onNewWorkspace={newWorkspace}
                 onImportWorkspace={importWorkspace}
@@ -2915,7 +2906,18 @@ flowchart LR
             binary-document viewers are code-split; the markdown viewer is not,
             so the common case never suspends here. */}
           <Suspense fallback={<main className="min-w-0 flex-1" aria-busy />}>
-            <main className="min-w-0 flex-1 pb-[max(1.5rem,env(safe-area-inset-bottom))] lg:pb-0">
+            {/* In split view the column is pinned to the viewport and each pane
+                scrolls itself. Without a real height here the group resolves
+                `h-full` against an auto-height parent, every pane grows to its
+                content, and the *window* ends up doing the scrolling — which is
+                why the panes used to move together. */}
+            <main
+              className={
+                paneLayout.panes.length > 1 && !showSaved
+                  ? "flex min-h-0 w-0 min-w-0 flex-1 flex-col overflow-hidden h-[calc(100dvh-var(--header-h,3.5rem))]"
+                  : "min-w-0 flex-1 pb-[max(1.5rem,env(safe-area-inset-bottom))] lg:pb-0"
+              }
+            >
               {/* Saved is a page, not an overlay: it takes the content column
                   instead of stacking on top of whatever document was open. */}
               {showSaved ? (

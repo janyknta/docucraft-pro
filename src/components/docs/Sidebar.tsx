@@ -36,7 +36,7 @@ import {
   Upload,
   CheckSquare,
   Share2,
-  X,
+  Columns2,
   Hash,
   Table,
   Code,
@@ -216,23 +216,10 @@ interface Props {
   onOpenSettings: (tab?: "workspace") => void;
   /** Open the Saved page, where stars and highlights live together. */
   onOpenSavedPage?: () => void;
-  /**
-   * Documents currently open, in the order they were opened.
-   *
-   * The reader's open documents live here rather than in a tab strip above the
-   * page: the sidebar already is the list of what this workspace holds, and a
-   * second list across the top of the reading column was the same information
-   * in a worse place.
-   */
-  openFileIds?: string[];
-  /** Which open document is on screen (in the focused column). */
-  currentOpenFileId?: string | null;
-  /** Ids that are showing in a side-by-side column right now. */
+  /** Ids already showing in a side-by-side column. */
   splitFileIds?: string[];
-  /** Put this document in a column beside the current one. */
-  onOpenBeside?: (fileId: string) => void;
-  /** Stop keeping this document open. */
-  onCloseOpenFile?: (fileId: string) => void;
+  /** Put this document in a column of its own, beside what is being read. */
+  onAddToSplit?: (fileId: string) => void;
   /** Open the Ask AI panel. When omitted, the Ask AI button is hidden. */
   onAskAi?: () => void;
   onNewWorkspace?: (name?: string) => void;
@@ -298,11 +285,8 @@ function SidebarImpl({
   onView,
   onOpenSettings,
   onOpenSavedPage,
-  openFileIds = [],
-  currentOpenFileId = null,
   splitFileIds = [],
-  onOpenBeside,
-  onCloseOpenFile,
+  onAddToSplit,
   onAskAi,
   onNewWorkspace,
   onImportWorkspace,
@@ -820,6 +804,8 @@ function SidebarImpl({
               onMoveToFolder={
                 onMoveFileToFolder ? (folderId) => onMoveFileToFolder(file.id, folderId) : undefined
               }
+              onAddToSplit={onAddToSplit ? () => onAddToSplit(file.id) : undefined}
+              alreadyInSplit={splitFileIds.includes(file.id)}
               onDownload={onDownloadFile ? () => onDownloadFile(file.id) : undefined}
               onShare={onShareFile ? () => onShareFile(file.id) : undefined}
               reordering={reordering}
@@ -971,84 +957,6 @@ function SidebarImpl({
             onCreateFolder={onCreateFolder ? promptNewFolder : undefined}
             onUpload={onAddFiles}
           />
-        </div>
-      )}
-
-      {/* What is open right now, above what the workspace holds.
-          Two documents can be read side by side from here: "⫿" puts one in a
-          column beside the current one. This replaced a tab strip over the
-          reading column — the sidebar is already the list of documents, and a
-          second list above the page said the same thing in a worse place. */}
-      {openFileIds.length > 0 && (
-        <div className="shrink-0 px-3 pb-1 pt-3">
-          <div className="px-1 pb-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Open
-          </div>
-          <ul className="space-y-0.5">
-            {openFileIds.map((fileId) => {
-              const file = files.find((f) => f.id === fileId);
-              if (!file) return null;
-              const current = fileId === currentOpenFileId;
-              const beside = splitFileIds.includes(fileId);
-              const KindIcon = kindIcon(kindOf(file));
-              return (
-                <li
-                  key={fileId}
-                  className={`group flex items-center gap-1 rounded-lg px-1 ${
-                    current ? "bg-accent/60" : "hover:bg-accent/40"
-                  }`}
-                >
-                  <button
-                    onClick={() => onSelect(fileId)}
-                    className="flex min-w-0 flex-1 items-center gap-2 rounded-md py-1.5 pl-1.5 pr-1 text-left"
-                    aria-current={current ? "page" : undefined}
-                  >
-                    <KindIcon
-                      className={`h-3.5 w-3.5 shrink-0 ${
-                        current ? "text-primary" : "text-muted-foreground/70"
-                      }`}
-                      aria-hidden
-                    />
-                    <span
-                      className={`min-w-0 flex-1 truncate text-sm ${
-                        current ? "font-semibold text-foreground" : "text-foreground/80"
-                      }`}
-                    >
-                      {file.name.replace(/\.[^.]+$/, "")}
-                    </span>
-                    {beside && (
-                      <span
-                        className="shrink-0 text-[10px] font-medium text-primary"
-                        title="Showing in a side-by-side column"
-                      >
-                        ⫿
-                      </span>
-                    )}
-                  </button>
-                  {onOpenBeside && !beside && (
-                    <button
-                      onClick={() => onOpenBeside(fileId)}
-                      aria-label={`Open ${file.name} beside the current document`}
-                      title="Open beside"
-                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground md:opacity-0 md:group-hover:opacity-100"
-                    >
-                      <span className="text-sm leading-none">⫿</span>
-                    </button>
-                  )}
-                  {onCloseOpenFile && (
-                    <button
-                      onClick={() => onCloseOpenFile(fileId)}
-                      aria-label={`Close ${file.name}`}
-                      title="Close"
-                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground md:opacity-0 md:group-hover:opacity-100"
-                    >
-                      <X className="h-3.5 w-3.5" />
-                    </button>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
         </div>
       )}
 
@@ -1378,12 +1286,18 @@ function FileMenu({
   folders = [],
   currentFolderId = null,
   onMoveToFolder,
+  onAddToSplit,
+  alreadyInSplit,
   onDownload,
   onShare,
   reordering,
   onToggleReorder,
   onSelectMode,
 }: {
+  /** Show this document in a column of its own, beside what is being read. */
+  onAddToSplit?: () => void;
+  /** Already has a column — the item says so rather than offering it twice. */
+  alreadyInSplit?: boolean;
   /** Open this document in the editor. Absent for non-editable file types. */
   onEdit?: () => void;
   onRename: () => void;
@@ -1471,6 +1385,18 @@ function FileMenu({
               onRename();
             }}
           />
+          {onAddToSplit && (
+            <MenuItem
+              icon={Columns2}
+              label={alreadyInSplit ? "Already in split view" : "Add to split view"}
+              disabled={alreadyInSplit}
+              onClick={(e) => {
+                e.stopPropagation();
+                setOpen(false);
+                onAddToSplit();
+              }}
+            />
+          )}
           {onMoveToFolder && folders.length > 0 && (
             <MenuItem
               icon={FolderInput}
